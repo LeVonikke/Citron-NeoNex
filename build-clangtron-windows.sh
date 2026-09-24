@@ -152,7 +152,7 @@
 #     --build DIR              Build directory (default: ./build)
 #     --compiler llvm-mingw|clang-cl  Toolchain (default: llvm-mingw)
 #     --jobs N                 Parallel jobs (default: nproc)
-#     --lto thin|full|none     LTO mode (default: full); MUST match across stages 1-2
+#     --lto thin|full|none     LTO mode (default: none); MUST match across stages 1-2
 #     --lite-lto               Alias for --lto thin
 #     --no-lto                 Alias for --lto none
 #     --pgo-type ir|fe|none    PGO mode (default: ir); MUST match across stages 1-2
@@ -218,7 +218,7 @@ LLVM_MINGW_VERSION="${LLVM_MINGW_VERSION:-20260224}"
 SOURCE_DIR="${SOURCE_DIR:-$(pwd)}"
 BUILD_ROOT="${BUILD_ROOT:-$(pwd)/build}"
 JOBS="${JOBS:-$(nproc)}"
-LTO_MODE="${LTO_MODE:-full}"
+LTO_MODE="${LTO_MODE:-none}"
 PGO_MODE="${PGO_MODE:-ir}"          # ir|fe|none
 UNITY_BUILD="${UNITY_BUILD:-OFF}"   # ENABLE_UNITY_BUILD
 TRACY_BUILD="${TRACY_BUILD:-OFF}"   # CITRON_ENABLE_TRACY
@@ -573,6 +573,7 @@ stage_setup_clangcl() {
         mingw-w64-clang-x86_64-nasm mingw-w64-clang-x86_64-yasm \
         mingw-w64-clang-x86_64-glslang mingw-w64-clang-x86_64-ninja \
         mingw-w64-clang-x86_64-sccache mingw-w64-clang-x86_64-jom \
+        mingw-w64-clang-x86_64-libarchive \
         2>/dev/null || error "Failed to install required MSYS2 packages."
 
     # Locate Python 3.12 — pre-installed on CI runners, installed via winget on dev machines.
@@ -708,6 +709,7 @@ stage_setup() {
             mingw-w64-clang-x86_64-nasm \
             mingw-w64-clang-x86_64-yasm \
             mingw-w64-clang-x86_64-glslang \
+            mingw-w64-clang-x86_64-libarchive \
             2>/dev/null || warn "Some pacman packages failed — check output above."
 
         info "MSYS2: llvm-mingw is the system clang64 environment."
@@ -1955,6 +1957,8 @@ build_common_cmake_args() {
         "-Dxbyak_FOUND=TRUE"
         "-Dcubeb_FOUND=TRUE"
         "-DENABLE_LIBUSB=ON"
+        # [Nextendo] Force OpenSSL instead of the Windows-default Schannel backend, matching local dev builds.
+        "-DENABLE_OPENSSL=ON"
         "-DVulkan_LIBRARY=${CMAKE_BUILD_ROOT}/vulkan-stub/libvulkan-1.a"
         "-DCITRON_USE_PRECOMPILED_HEADERS=OFF"
         "-DCITRON_USE_CPM=ON"
@@ -4797,10 +4801,13 @@ cmake -S "${source_win}" -B "${build_win}" -G "Ninja Multi-Config" ^
 ${sccache_cmake_args}
   -DCMAKE_POLICY_DEFAULT_CMP0141=NEW -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT="$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>" ^
   -DCITRON_USE_CPM=ON -DCITRON_USE_BUNDLED_VCPKG=OFF -DCITRON_CHECK_SUBMODULES=OFF ^
+  -DCITRON_BUILD_TYPE="${CITRON_BUILD_TYPE:-Stable}" ^
   -DCPM_SOURCE_CACHE="${cpm_win}" ^
   -DCITRON_CLANGCL=ON -DCITRON_USE_BUNDLED_QT=ON -DCITRON_USE_BUNDLED_FFMPEG=ON ^
   -DBUILD_TESTING=OFF -DCITRON_TESTS=OFF -DCITRON_SHADER_TOOL=OFF ^
   -DCITRON_CRASH_DUMPS=OFF ^
+  -DCITRON_USE_AUTO_UPDATER=ON ^
+  -DENABLE_OPENSSL=ON ^
   -DENABLE_UNITY_BUILD=${UNITY_BUILD} ^
   -DPython3_EXECUTABLE="${python_win}" ^
   -DPERL_EXECUTABLE="${perl_win}" ^
@@ -4826,13 +4833,16 @@ ${sccache_stats_cmd}
 if not exist "${package_copy_win}" mkdir "${package_copy_win}"
 for %%F in ("${package_copy_win}\\*") do if exist "%%F" del /F /Q "%%F"
 for /D %%D in ("${package_copy_win}\\*") do if /I not "%%~nxD"=="user" if exist "%%D" rmdir /S /Q "%%D"
-if not exist "${package_copy_win}\\user" mkdir "${package_copy_win}\\user"
 copy /Y "${build_copy_win}\\bin\\${config}\\citron.exe" "${package_copy_win}\\citron.exe" >NUL
 if errorlevel 1 exit /b %errorlevel%
 copy /Y "${build_copy_win}\\bin\\${config}\\citron-cmd.exe" "${package_copy_win}\\citron-cmd.exe" >NUL
 if errorlevel 1 exit /b %errorlevel%
 copy /Y "${build_copy_win}\\bin\\${config}\\citron-room.exe" "${package_copy_win}\\citron-room.exe" >NUL
 if errorlevel 1 exit /b %errorlevel%
+if exist "${build_copy_win}\\bin\\${config}\\citron-updater-helper.exe" (
+  copy /Y "${build_copy_win}\\bin\\${config}\\citron-updater-helper.exe" "${package_copy_win}\\citron-updater-helper.exe" >NUL
+  if errorlevel 1 exit /b 1
+)
 if exist "${build_copy_win}\\bin\\${config}\\*.dll" (
   copy /Y "${build_copy_win}\\bin\\${config}\\*.dll" "${package_copy_win}\\" >NUL
   if errorlevel 1 exit /b 1

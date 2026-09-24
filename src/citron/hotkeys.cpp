@@ -241,13 +241,32 @@ void ControllerShortcut::ControllerUpdateEvent(Core::HID::ControllerTriggerType 
     const u64 player_home_buttons =
         emulated_controller->GetHomeButtons().raw & button_sequence.home.raw;
 
-    if (player_npad_buttons == button_sequence.npad.raw &&
-        player_capture_buttons == button_sequence.capture.raw &&
-        player_home_buttons == button_sequence.home.raw && !active) {
-        // Force user to press the home or capture button again
-        active = true;
-        emit Activated();
+    const bool matches = player_npad_buttons == button_sequence.npad.raw &&
+                        player_capture_buttons == button_sequence.capture.raw &&
+                        player_home_buttons == button_sequence.home.raw;
+
+    // A held combo can briefly read as "not matching" for a single poll (wireless dropout,
+    // switch bounce) without the user actually releasing anything; treating that as a real
+    // release re-armed the latch mid-hold and let it fire again a poll later. Require the
+    // non-match to be sustained for a short window before actually clearing `active`. This
+    // also naturally throttles mashing the combo faster than that window allows.
+    constexpr auto release_debounce = std::chrono::milliseconds(80);
+    const auto now = std::chrono::steady_clock::now();
+
+    if (matches) {
+        matched_last_poll = true;
+        if (!active) {
+            active = true;
+            emit Activated();
+        }
         return;
     }
-    active = false;
+
+    if (matched_last_poll) {
+        release_started = now;
+        matched_last_poll = false;
+    }
+    if (active && now - release_started >= release_debounce) {
+        active = false;
+    }
 }

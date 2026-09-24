@@ -17,10 +17,20 @@ struct Entry {
     std::string name;
     s32 status = 0;        // 0 offline, 1 online, 2 in a game
     std::string app_field; // opaque per-title presence blob, raw bytes (already base64-decoded)
+    std::vector<u8> image; // profile picture, raw JPEG bytes (already base64-decoded); empty if none
 };
 
 void Set(std::vector<Entry> entries);
 std::vector<Entry> Get();
+
+// [Nextendo] Get() never blocks -- essential for NEX titles, which poll this in a loop from
+// their own online thread; blocking there would stall PRUDP acks and the server would declare a
+// communication error. But Splatoon 3 requests its friend list exactly ONCE, early in boot
+// (matches Ryujinx-Nextendo's own measurement: still empty at 39s in), and never asks again --
+// if the frontend's background refresh hasn't populated the cache by then, that title is stuck
+// with zero friends for its whole session. GetWarm() gives that one call a short, bounded wait
+// for the cache to warm up instead. Never used by NEX titles' own repeated polling.
+std::vector<Entry> GetWarm(int timeout_ms);
 
 // This player's own presence, as last set by the running game. Pushed to the account server so
 // friends see them online.

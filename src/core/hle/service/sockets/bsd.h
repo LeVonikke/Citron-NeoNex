@@ -4,10 +4,15 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
+#include <deque>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
-#include <map>
 
 #include "common/common_types.h"
 #include "common/expected.h"
@@ -52,7 +57,35 @@ private:
         Network::Protocol protocol = Network::Protocol::UDP;
         u16 bound_port = 0;
         bool sni_injected = false;
+        // [Nextendo] RecvImpl's post-handshake grace-wait (see bsd.cpp) should only cover a
+        // reply that might genuinely still be in flight -- set true by SendImpl right after the
+        // guest writes something on this socket, and consumed (cleared) the first time RecvImpl
+        // uses the wait afterward. Without this, every immediate "is there anything else?"
+        // recv() the guest makes right after already getting a full reply -- completely normal
+        // client behaviour -- also blocks for up to 800ms even though nothing more is ever
+        // coming until the guest itself sends its next request. Measured: three of these firing
+        // back-to-back after the real reply already arrived is the entire 1.6-1.7s stall before
+        // the game gives up and resets the stream.
+        bool awaiting_reply = false;
+        // [Nextendo] Splatoon 3's vendor-private setsockopt optname=0x80000001 (see bsd.cpp's
+        // SetSockOptImpl/GetSockOptImpl) is accepted but never applied to the real socket --
+        // stash the bytes it was "set" to so a getsockopt right afterward echoes them back,
+        // matching Ryujinx-Nextendo's own _feignedSockOpts behavior for the same option.
+        std::optional<std::array<u8, 8>> vendor_linger_feigned;
         bool connected = false;
+        // [Nextendo][DIAG] Set on a successful ConnectImpl -- lets ShutdownImpl log how long
+        // this specific connection actually lived before the guest gave up on it, to check for
+        // a correlation with a round-number wall-clock deadline (grpc-core's own deadline_filter
+        // is wall-clock-based, not a fixed retry count).
+        std::optional<std::chrono::steady_clock::time_point> connect_success_time;
+        // [Nextendo] Set by EventFd(). Lets Poll() recognize a self-pipe wakeup fd (see
+        // sockets.h's SetBsdDeferralEvent) and lets SendImpl() know a Write() to this fd is a
+        // completion signal another thread's deferred Poll() may be waiting on.
+        bool is_eventfd = false;
+        // Datagrams a parked UDP socket's background drain thread received before this fd
+        // reclaimed it (see ParkUdpSocket in bsd.cpp) — served before any live socket read so
+        // nothing arriving during the close/park/rebind gap is lost.
+        std::deque<std::pair<std::vector<u8>, Network::SockAddrIn>> pending_datagrams;
     };
 
     struct PollWork {
@@ -200,6 +233,30 @@ private:
     std::pair<s32, Errno> SocketImpl(Domain domain, Type type, Protocol protocol);
     std::pair<s32, Errno> PollImpl(std::vector<u8>& write_buffer, std::span<const u8> read_buffer,
                                    s32 nfds, s32 timeout);
+    // [Nextendo] True if any fd in this poll's set was created by EventFd(). See Poll()'s
+    // definition and sockets.h's SetBsdDeferralEvent declaration comment.
+    bool PollSetIncludesEventFd(std::span<const u8> read_buffer, s32 nfds) const;
+
+    // [Nextendo] Snapshot of a deferred Poll()'s pollfd bytes, keyed by the HLERequestContext
+    // this specific request is riding on. ctx.ReadBuffer() re-reads live guest memory at the
+    // buffer descriptor's address every time it's called, including on a deferred poll's later
+    // re-check -- but that guest memory is the session's shared pointer-buffer region, which an
+    // unrelated bsd IPC call can (and does) reuse for its own buffer before the re-check fires.
+    // Without a snapshot, the re-check silently reparses whatever that other call left there as
+    // if it were still this poll's fd list. Matches Ryujinx-Nextendo's own fix for this exact
+    // bug (ServerBase.cs's DeferredPoll.InputSnapshot).
+    //
+    // [Nextendo] `deadline` makes this cover ANY nonzero timeout (matching Ryujinx-Nextendo's own
+    // `timeout != 0` condition in IClient.cs), not just an infinite one -- deferring a bounded
+    // wait is only safe because the re-check path (below) now honors this deadline directly
+    // instead of waiting on the KEvent forever, so a title's own timeout still fires on time.
+    // nullopt means infinite (no deadline).
+    struct DeferredPollState {
+        std::vector<u8> read_buffer;
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+    };
+    std::mutex deferred_poll_snapshot_mutex;
+    std::map<const HLERequestContext*, DeferredPollState> deferred_poll_snapshots;
     std::pair<s32, Errno> SelectImpl(s32 nfds, s32 timeout, std::span<const u8> read_in,
                                      std::span<const u8> write_in, std::span<const u8> error_in,
                                      std::vector<u8>& read_out, std::vector<u8>& write_out,

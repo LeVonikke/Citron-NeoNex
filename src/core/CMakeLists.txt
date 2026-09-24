@@ -1138,6 +1138,8 @@ add_library(core STATIC
     hle/service/ssl/ssl.cpp
     hle/service/ssl/ssl.h
     hle/service/ssl/ssl_backend.h
+    hle/service/ssl/ssl_pending_registry.cpp
+    hle/service/ssl/ssl_pending_registry.h
     hle/service/ssl/ssl_types.h
     hle/service/tma/file_io.cpp
     hle/service/tma/file_io.h
@@ -1198,6 +1200,8 @@ add_library(core STATIC
     loader/nax.h
     loader/nca.cpp
     loader/nca.h
+    loader/nextendo_s3_patches.cpp
+    loader/nextendo_s3_patches.h
     loader/nro.cpp
     loader/nro.h
     loader/nso.cpp

@@ -20,13 +20,16 @@ class NextendoToast : public QWidget {
 
 public:
     enum class Corner { TopRight, TopLeft, BottomRight, BottomLeft };
-    enum class Kind { Online, Offline, Request, RequestSent };
+    enum class Kind { Online, Offline, Request, RequestSent, ChatRequest };
 
     explicit NextendoToast(QWidget* main_window);
     ~NextendoToast() override;
 
     void Show(const QString& headline, const QString& detail, const QString& avatar_base64,
              Kind kind = Kind::Online);
+
+signals:
+    void clicked(NextendoToast::Kind kind);
 
 protected:
     void paintEvent(QPaintEvent*) override;

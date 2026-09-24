@@ -72,9 +72,10 @@ private:
 
     DisplayParams ComputeOverlayDisplayParams(Applet& applet) const;
     DisplayParams ComputeStandardDisplayParams(Applet& applet, bool is_foreground,
-                                               bool input_intercepted) const;
+                                               bool input_intercepted, bool is_obscured) const;
 
     void PruneTerminatedAppletsLocked();
+    bool RestartAppletProcessLocked(const std::shared_ptr<Applet>& applet);
     bool LockHomeMenuIntoForegroundLocked();
     void TerminateChildAppletsLocked(Applet* applet);
     void ReconcileAppletTreeLocked(Applet* applet, bool is_foreground, bool input_intercepted);

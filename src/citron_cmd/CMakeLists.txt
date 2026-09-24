@@ -23,8 +23,17 @@ add_executable(citron-cmd
     citron_sdl_config.cpp
     citron_sdl_config.h
     citron.cpp
-    citron.rc
 )
+
+# [Nextendo] Same fix as src/citron/CMakeLists.txt's citron_rc: keep citron.rc out of the
+# Boost/Qt include list so its RC-compile command line stays under Windows' length limit.
+if (WIN32)
+    add_library(citron_cmd_rc OBJECT citron.rc)
+    set_target_properties(citron_cmd_rc PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    target_link_libraries(citron-cmd PRIVATE citron_cmd_rc)
+else()
+    target_sources(citron-cmd PRIVATE citron.rc)
+endif()
 
 # Robust static linking and linker selection under GCC LTO
 # Linker selection: For Clang, the global configuration defaults to lld.
@@ -110,13 +119,6 @@ if (MSVC AND CITRON_USE_BUNDLED_SDL2)
 elseif(MINGW)
     include(CopyMinGWDeps)
     copy_mingw_deps(citron-cmd SEARCH_PATHS "${FFmpeg_PATH}/bin" "${QT_TARGET_PATH}/bin")
-endif()
-
-if(WIN32)
-    add_custom_command(TARGET citron-cmd POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:citron-cmd>/user"
-        COMMENT "Creating portable user directory for citron-cmd"
-    )
 endif()
 
 if (CITRON_USE_PRECOMPILED_HEADERS)

@@ -265,11 +265,21 @@ add_executable(citron
     nextendo_account_page_p.h
     nextendo_avatar_cache.cpp
     nextendo_avatar_cache.h
+    nextendo_chat_client.cpp
+    nextendo_chat_client.h
+    nextendo_chat_room.cpp
+    nextendo_chat_room.h
+    nextendo_chat_room.ui
+    nextendo_chat_room_member_delegate.cpp
+    nextendo_chat_room_member_delegate.h
+    nextendo_chat_window.cpp
+    nextendo_chat_window.h
     nextendo_controller.cpp
+    nextendo_room_overlay.cpp
+    nextendo_room_overlay.h
     nextendo_controller.h
     nextendo_friend_delegate.cpp
     nextendo_friend_delegate.h
-    nextendo_compatible_titles.h
     nextendo_history_delegate.cpp
     nextendo_history_delegate.h
     nextendo_network_probe.cpp
@@ -280,6 +290,8 @@ add_executable(citron
     nextendo_population_dialog.h
     nextendo_population_history.cpp
     nextendo_population_history.h
+    nzp_online_count.cpp
+    nzp_online_count.h
     nextendo_toast.cpp
     nextendo_toast.h
     precompiled_headers.h
@@ -326,6 +338,8 @@ add_executable(citron
     ui/game_grid_view.h
     ui/game_carousel_view.cpp
     ui/game_carousel_view.h
+    ui/system_audio_loopback.cpp
+    ui/system_audio_loopback.h
     ui/population_bar_chart.cpp
     ui/population_bar_chart.h
     ui/nextendo_profile_chip.cpp
@@ -337,8 +351,34 @@ add_executable(citron
     ui/nav_settings_overlay.cpp
     ui/nav_settings_overlay.h
     citron.qrc
-    citron.rc
 )
+
+# citron.rc only #includes winresrc.h -- it needs none of the target's C++ include dirs, but
+# as a source of the main `citron` target it inherits all of them anyway (Boost alone
+# contributes 150+ separate -I flags since CPM exposes each submodule individually). CMake's
+# RC language doesn't honor a per-source INCLUDE_DIRECTORIES override, so the only way to
+# keep the RC compile command under Windows' CreateProcess argument limit ("The parameter is
+# incorrect. (is the command line too long?)") is to compile it in its own target that never
+# links against Boost/Qt/etc. in the first place.
+#
+# WIN32-only: RC is a Windows resource-compiler language that isn't enabled on other
+# platforms' CMake configuration here, so an OBJECT library whose only source is a .rc file
+# has no linker language CMake can determine on Linux/macOS ("CMake can not determine linker
+# language for target: citron_rc") -- previously citron.rc was just an inert extra source
+# on the main citron target there (mixed with its many .cpp sources, whose CXX language
+# CMake fell back on), which is the behavior this keeps for non-Windows builds.
+if (WIN32)
+    add_library(citron_rc OBJECT citron.rc)
+    set_target_properties(citron_rc PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    target_link_libraries(citron PRIVATE citron_rc)
+endif()
+
+if (UNIX AND NOT APPLE)
+    target_sources(citron PRIVATE
+        linux_crash_handler.cpp
+        linux_crash_handler.h
+    )
+endif()
 
 # Qt AUTOGEN/RCC sources are not unity-safe.
 set_property(TARGET citron PROPERTY UNITY_BUILD OFF)
@@ -598,6 +638,13 @@ if (TARGET LibArchive::LibArchive)
     target_compile_definitions(citron PRIVATE CITRON_ENABLE_LIBARCHIVE)
 endif()
 
+# PulseAudio, for the "Reactive" carousel backdrop's system-audio loopback capture (Linux only).
+if (LIBPULSE_FOUND)
+    target_include_directories(citron PRIVATE ${LIBPULSE_INCLUDE_DIRS})
+    target_link_libraries(citron PRIVATE ${LIBPULSE_LIBRARIES})
+    target_compile_definitions(citron PRIVATE CITRON_ENABLE_PULSE_LOOPBACK)
+endif()
+
 target_link_libraries(citron PRIVATE Vulkan::Headers)
 if (UNIX AND NOT APPLE AND NOT ${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     target_link_libraries(citron PRIVATE Qt6::GuiPrivate)
@@ -692,12 +739,6 @@ if (WIN32 AND QT_VERSION VERSION_GREATER_EQUAL 6)
         # DLL version conflicts between Qt's bundled GCC runtime and MSYS2's.
         message(STATUS "MinGW build: Qt plugins deployed by CopyMinGWDeps.cmake")
     endif()
-
-    # Create the "user" directory for portable mode
-    add_custom_command(TARGET citron POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${CITRON_EXE_DIR}/user"
-        COMMENT "Creating portable user directory"
-    )
 endif()
 
 if (WIN32 AND CITRON_USE_BUNDLED_QT)

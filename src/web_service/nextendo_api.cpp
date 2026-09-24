@@ -29,12 +29,20 @@
 #include "common/string_util.h"
 #include "web_service/nextendo_api.h"
 
+#if __has_include("web_service/nextendo_secrets.h")
+#include "web_service/nextendo_secrets.h"
+#else
+namespace WebService::NextendoApi {
+constexpr const char* AppClientId = "";
+}
+#endif
+
 namespace WebService::NextendoApi {
 
 namespace {
 
 constexpr const char* CanonicalUrl = "https://nextendo.network";
-constexpr const char* ClientId = "nextendo-emulator";
+constexpr const char* ClientId = AppClientId;
 constexpr int TimeoutSeconds = 15;
 
 // httplib renamed Client::get_openssl_verify_result() to get_verify_result()
@@ -295,13 +303,23 @@ httplib::Client& SharedClient() {
     return client;
 }
 
+// Every /api/ route requires the issued client id. Public checkouts build without the secret
+// header and send nothing, which the server answers with 401.
+httplib::Headers BaseHeaders() {
+    httplib::Headers headers{{"User-Agent", "citron"}};
+    if (*ClientId != '\0') {
+        headers.emplace("X-Nextendo-Client-Id", ClientId);
+    }
+    return headers;
+}
+
 httplib::Result Send(const std::string& method, const std::string& path, const std::string& body,
                      const std::string& bearer, const httplib::Headers& extra_headers = {}) {
     static std::mutex client_mutex;
     std::lock_guard lock{client_mutex};
     httplib::Client& client = SharedClient();
 
-    httplib::Headers headers{{"User-Agent", "citron"}};
+    httplib::Headers headers = BaseHeaders();
     if (!bearer.empty()) {
         headers.emplace("Authorization", "Bearer " + bearer);
     }
@@ -404,7 +422,8 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
 
     const std::string auth_url =
         fmt::format("{}/api/oauth/authorize?response_type=code&client_id={}"
-                    "&redirect_uri={}&scope=identity+friends&state={}"
+                    "&redirect_uri={}&scope=identity+friends+sauvegardes+history+presence"
+                    "&app=citron&state={}"
                     "&code_challenge={}&code_challenge_method=S256",
                     BaseUrl(), ClientId, PercentEncode(redirect_uri), state, challenge);
     LOG_INFO(WebService, "SignInWithBrowser: opening {}", auth_url);
@@ -454,7 +473,7 @@ LoginResult SignInWithBrowser(const std::function<void(const std::string&)>& ope
     client.set_follow_location(true);
     ApplyCaCertPath(client);
 
-    const auto result = client.Post("/api/oauth/token", form);
+    const auto result = client.Post("/api/oauth/token", BaseHeaders(), form);
     if (!result) {
         out.error = "Could not reach the Nextendo account server.";
         const long verify_result = GetSslVerifyResult(client);
@@ -542,36 +561,10 @@ std::vector<u8> DownloadBcatSeed(const std::string& title_id_hex) {
     return std::vector<u8>(result->body.begin(), result->body.end());
 }
 
-BcatSeedCheck DownloadBcatSeedIfNewer(const std::string& title_id_hex,
-                                      const std::string& if_modified_since) {
-    const std::string token = Common::NextendoAccount::GetToken();
-    httplib::Headers extra;
-    if (!if_modified_since.empty()) {
-        extra.emplace("If-Modified-Since", if_modified_since);
-    }
-    const auto result = Send("GET", "/api/bcat/" + title_id_hex, {}, token, extra);
-
-    BcatSeedCheck check;
-    if (ClearSessionIfRejected(result)) {
-        return check;
-    }
-    if (!result) {
-        LOG_WARNING(WebService, "Nextendo BCAT freshness check failed (no response)");
-        return check;
-    }
-    if (result->status == 304) {
-        check.not_modified = true;
-        return check;
-    }
-    if (result->status != 200) {
-        LOG_WARNING(WebService, "Nextendo BCAT seed download failed (HTTP {})", result->status);
-        return check;
-    }
-    if (const auto it = result->headers.find("Last-Modified"); it != result->headers.end()) {
-        check.last_modified = it->second;
-    }
-    check.zip_bytes.assign(result->body.begin(), result->body.end());
-    return check;
+std::string HashBcatSeedHex(const std::vector<u8>& data) {
+    const auto digest = Sha256(std::string_view{reinterpret_cast<const char*>(data.data()),
+                                                 data.size()});
+    return Common::HexToString(digest, false);
 }
 
 std::optional<std::vector<u8>> PullSave(const std::string& title_id_hex) {
@@ -632,6 +625,28 @@ std::map<std::string, int> GetOnlineCounts() {
     }
 
     return out;
+}
+
+int GetNzpOnlineCount() {
+    const char* env = std::getenv("NZP_API"); // test VPS by default
+    const std::string base_url = (env && *env) ? env : "http://144.202.45.50:8090";
+
+    httplib::Client client{base_url};
+    client.set_connection_timeout(3);
+    client.set_read_timeout(3);
+    const auto result = client.Get("/online-count");
+    if (!result || result->status != 200) {
+        return 0;
+    }
+    try {
+        const auto json = nlohmann::json::parse(result->body);
+        if (const auto it = json.find("count"); it != json.end() && it->is_number_integer()) {
+            return it->get<int>();
+        }
+    } catch (const nlohmann::json::exception& e) {
+        LOG_WARNING(WebService, "Unexpected nzp online-count response: {}", e.what());
+    }
+    return 0;
 }
 
 Profile GetProfile() {
@@ -806,7 +821,8 @@ void SyncHistory(const std::vector<HistoryEntry>& entries) {
     client.set_follow_location(true);
     ApplyCaCertPath(client);
 
-    httplib::Headers headers{{"User-Agent", "citron"}, {"Authorization", "Bearer " + token}};
+    httplib::Headers headers = BaseHeaders();
+    headers.emplace("Authorization", "Bearer " + token);
     const auto result = client.Put("/api/history", headers,
                                    nlohmann::json{{"history", history}}.dump(), "application/json");
 
@@ -842,9 +858,27 @@ Friend ParseFriend(const nlohmann::json& json) {
         out.app_field = std::string{reinterpret_cast<const char*>(decoded.data()), decoded.size()};
         out.app_id = presence->value("app_id", std::string{});
         out.app_name = presence->value("app_name", std::string{});
-        LOG_DEBUG(WebService, "[Nextendo] ParseFriend pid={} status={} app_field={}", out.pid,
-                 out.presence_status, Common::HexToString(decoded, false));
     }
+    // [Nextendo] TEMP: unconditional (not gated on "presence" being present) so we can see
+    // whether name/username ever actually comes back non-empty from the account server, or
+    // whether the Friends viewer's blank tiles are a server-data gap rather than a client bug.
+    LOG_DEBUG(WebService, "[Nextendo] ParseFriend pid={} name='{}' status={} app_field={}",
+             out.pid, out.name, out.presence_status, Common::HexToString(
+                 std::vector<u8>(out.app_field.begin(), out.app_field.end()), false));
+    return out;
+}
+
+LobbyPlayer ParseLobbyPlayer(const nlohmann::json& json) {
+    LobbyPlayer out;
+    out.pid = json.value("pid", u64{0});
+    out.name = json.value("name", std::string{});
+    out.known = json.value("known", false);
+    out.avatar_url = json.value("avatar_url", std::string{});
+    out.friend_code = json.value("friend_code", std::string{});
+    out.host = json.value("host", false);
+    out.is_me = json.value("is_me", false);
+    out.title_id = json.value("title_id", std::string{});
+    out.seen_at = json.value("seen_at", std::string{});
     return out;
 }
 
@@ -881,15 +915,18 @@ FriendList GetFriends() {
     const auto result = Send("GET", "/api/friends", {}, token);
     if (ClearSessionIfRejected(result)) {
         out.error = "Your session expired. Sign in again.";
+        LOG_WARNING(WebService, "GetFriends: {}", out.error);
         return out;
     }
     if (!result) {
         out.error = "Could not reach the Nextendo account server.";
+        LOG_WARNING(WebService, "GetFriends: {}", out.error);
         return out;
     }
     if (result->status != 200) {
         out.error = ErrorFrom(result->body, fmt::format("Could not load friends (HTTP {}).",
                                                        result->status));
+        LOG_WARNING(WebService, "GetFriends: {}", out.error);
         return out;
     }
 
@@ -902,8 +939,11 @@ FriendList GetFriends() {
             out.requests.push_back(ParseFriend(entry));
         }
         out.ok = true;
+        LOG_INFO(WebService, "GetFriends: {} friend(s), {} request(s)", out.friends.size(),
+                 out.requests.size());
     } catch (const nlohmann::json::exception& e) {
         out.error = fmt::format("Unexpected friends response: {}", e.what());
+        LOG_WARNING(WebService, "GetFriends: {}", out.error);
     }
 
     return out;
@@ -985,6 +1025,104 @@ void PushPresence(s32 status, const std::string& app_field, const std::string& a
         return;
     }
     LOG_DEBUG(WebService, "Nextendo presence published (status={})", status);
+}
+
+Lobby GetMyLobby() {
+    Lobby out;
+
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return out;
+    }
+
+    const auto result = Send("GET", "/api/my-lobby", {}, token);
+    if (ClearSessionIfRejected(result) || !result || result->status != 200) {
+        return out;
+    }
+
+    try {
+        const auto json = nlohmann::json::parse(result->body);
+        out.in_lobby = json.value("in_lobby", false);
+        if (!out.in_lobby) {
+            return out;
+        }
+        out.title_id = json.value("title_id", std::string{});
+        if (const auto lobby = json.find("lobby"); lobby != json.end()) {
+            out.type = lobby->value("type", std::string{});
+            out.state = lobby->value("state", std::string{});
+            out.state_code = lobby->value("state_code", std::string{});
+            out.id = lobby->value("id", u64{0});
+            out.count = lobby->value("count", 0);
+            out.max = lobby->value("max", 0);
+        }
+        for (const auto& entry : json.value("players", nlohmann::json::array())) {
+            out.players.push_back(ParseLobbyPlayer(entry));
+        }
+    } catch (const nlohmann::json::exception& e) {
+        LOG_WARNING(WebService, "GetMyLobby: {}", e.what());
+        out = {};
+    }
+
+    return out;
+}
+
+std::vector<LobbyPlayer> GetRecentPlayers() {
+    std::vector<LobbyPlayer> out;
+
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return out;
+    }
+
+    const auto result = Send("GET", "/api/recent-players", {}, token);
+    if (ClearSessionIfRejected(result) || !result || result->status != 200) {
+        return out;
+    }
+
+    try {
+        const auto json = nlohmann::json::parse(result->body);
+        for (const auto& entry : json.value("players", nlohmann::json::array())) {
+            out.push_back(ParseLobbyPlayer(entry));
+        }
+    } catch (const nlohmann::json::exception& e) {
+        LOG_WARNING(WebService, "GetRecentPlayers: {}", e.what());
+    }
+
+    return out;
+}
+
+std::string GetAvatarByPid(u64 pid) {
+    if (pid == 0) {
+        return {};
+    }
+    // No bearer: /api/avatar is public, and the token must never leave with a request whose
+    // target could be influenced by server-supplied data. The path is built from pid alone.
+    const auto result = Send("GET", fmt::format("/api/avatar?pid={}", pid), {}, {});
+    if (!result || result->status != 200) {
+        return {};
+    }
+    return Base64StdEncode(
+        std::span<const u8>{reinterpret_cast<const u8*>(result->body.data()), result->body.size()});
+}
+
+std::string ReportPlayer(u64 pid, const std::string& reason, const std::string& comment) {
+    const std::string token = Common::NextendoAccount::GetToken();
+    if (token.empty()) {
+        return "Not signed in.";
+    }
+    const std::string body =
+        nlohmann::json{{"target_pid", pid}, {"reason", reason}, {"comment", comment}}.dump();
+    const auto result = Send("POST", "/api/report-player", body, token);
+    if (ClearSessionIfRejected(result)) {
+        return "Your session expired. Sign in again.";
+    }
+    if (!result) {
+        return "Could not reach the Nextendo account server.";
+    }
+    if (result->status != 200) {
+        return ErrorFrom(result->body, fmt::format("Request failed (HTTP {}).", result->status));
+    }
+    return {};
 }
 
 std::optional<int> PingBackend() {

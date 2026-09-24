@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -75,7 +77,11 @@ void Conductor::VsyncThread(std::stop_token token) {
     Common::SetCurrentThreadName("VSyncThread");
 
     while (!token.stop_requested()) {
-        m_signal.Wait();
+        // Bounded wait rather than an unconditional one: if the CoreTiming-driven signal is
+        // ever missed (a stalled/rescheduled looping event, a lost wakeup, etc.), this thread
+        // must not starve the compositor forever. Falling through on timeout and composing
+        // anyway keeps frame presentation alive even when the driving signal doesn't arrive.
+        m_signal.WaitFor(std::chrono::milliseconds(100));
 
         if (m_system.IsShuttingDown()) {
             return;
@@ -100,15 +106,19 @@ s64 Conductor::GetNextTicks() const {
     }
 
     // Adjust by speed limit determined during composition.
-    speed_scale /= m_compose_speed_scale;
+    speed_scale /= std::max(m_compose_speed_scale, 0.01f);
 
     if (m_system.GetNVDECActive() && settings.use_video_framerate.GetValue()) {
         // Run at intended presentation rate during video playback.
         speed_scale = 1.f;
     }
 
-    const f32 effective_fps = 60.f / static_cast<f32>(m_swap_interval);
-    return static_cast<s64>(speed_scale * (1000000000.f / effective_fps));
+    const s32 swap_interval = std::max(m_swap_interval, 1);
+    const f32 effective_fps = 60.f / static_cast<f32>(swap_interval);
+    const s64 next_ticks = static_cast<s64>(speed_scale * (1000000000.f / effective_fps));
+
+    // Never let a pathological speed_scale/swap_interval starve vsync indefinitely.
+    return std::clamp<s64>(next_ticks, 1'000'000, 1'000'000'000);
 }
 
 } // namespace Service::VI

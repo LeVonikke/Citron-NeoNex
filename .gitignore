@@ -74,4 +74,7 @@ dtrace-out/
 *.diff
 .cache/
 
-.diagnostics/build-conntest/
+.diagnostics/
+
+# Issued API client id, injected by CI from the NEXTENDO_CLIENT_ID secret
+src/web_service/nextendo_secrets.h

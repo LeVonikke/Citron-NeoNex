@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "common/scope_exit.h"
+#include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_hardware_timer.h"
@@ -9,6 +12,7 @@
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/nextendo_deadline_watch.h"
 
 namespace Kernel::Svc {
 namespace {
@@ -107,6 +111,17 @@ void SleepThread(Core::System& system, s64 ns) {
 
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", ns);
 
+    // [Nextendo][DIAG] SleepThread isn't covered by the WaitSynchronization deadline watch --
+    // if the game's retry/timer logic sleeps a thread directly instead of waiting on an object
+    // with a timeout, this is where that would show up.
+    const bool diag_sleep = ns > 50'000'000 && IsNextendoDeadlineWatchActive();
+    std::chrono::steady_clock::time_point diag_sleep_start{};
+    if (diag_sleep) {
+        diag_sleep_start = std::chrono::steady_clock::now();
+        LOG_INFO(Kernel_SVC, "[Nextendo][DIAG] SleepThread starting, requested={}ms",
+                 ns / 1'000'000);
+    }
+
     // When the input tick is positive, sleep.
     if (ns > 0) {
         // Convert the timeout from nanoseconds to ticks.
@@ -126,6 +141,14 @@ void SleepThread(Core::System& system, s64 ns) {
         // Sleep.
         // NOTE: Nintendo does not check the result of this sleep.
         static_cast<void>(GetCurrentThread(kernel).Sleep(timeout));
+
+        if (diag_sleep) {
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - diag_sleep_start)
+                                         .count();
+            LOG_INFO(Kernel_SVC, "[Nextendo][DIAG] SleepThread resolved after {}ms wall-clock",
+                     elapsed_ms);
+        }
     } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
         KScheduler::YieldWithoutCoreMigration(kernel);
     } else if (yield_type == Svc::YieldType::WithCoreMigration) {

@@ -2,12 +2,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging.h"
 #include "core/core.h"
 #include "core/hle/service/am/am_results.h"
 #include "core/hle/service/am/am_types.h"
 #include "core/hle/service/am/applet.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/am/event_observer.h"
+#include "core/hle/service/am/process_creation.h"
 #include "core/hle/service/am/window_system.h"
 
 namespace Service::AM {
@@ -38,15 +40,17 @@ WindowSystem::DisplayParams WindowSystem::ComputeOverlayDisplayParams(Applet& ap
 }
 
 WindowSystem::DisplayParams WindowSystem::ComputeStandardDisplayParams(
-    Applet& applet, bool is_foreground, bool input_intercepted) const {
+    Applet& applet, bool is_foreground, bool input_intercepted, bool is_obscured) const {
     DisplayParams dp{};
 
-    const bool active = applet.is_process_running && is_foreground;
+    const bool active = is_foreground;
 
     dp.visible = active && applet.window_visible;
     dp.interactible = active && applet.window_visible && !input_intercepted;
 
-    if (active && applet.window_visible) {
+    // An applet obscured by one of its own foreground children must drop below it, or the
+    // two end up tied and the compositor can pick either one to show on top.
+    if (active && !is_obscured) {
         dp.z_index = 2;
     } else if (active) {
         dp.z_index = 1;
@@ -109,7 +113,7 @@ void WindowSystem::TrackApplet(std::shared_ptr<Applet> applet, bool is_applicati
         m_application = applet.get();
     }
 
-    m_event_observer->TrackAppletProcess(*applet);
+    m_event_observer->TrackAppletProcess(applet);
     m_applets.emplace(applet->aruid.pid, std::move(applet));
 }
 
@@ -129,6 +133,10 @@ std::shared_ptr<Applet> WindowSystem::GetMainApplet() {
 
     if (m_application) {
         return m_applets.at(m_application->aruid.pid);
+    }
+
+    if (m_home_menu) {
+        return m_applets.at(m_home_menu->aruid.pid);
     }
 
     return nullptr;
@@ -263,6 +271,37 @@ void WindowSystem::PruneTerminatedAppletsLocked() {
             continue;
         }
 
+        // A winding applet has had its own process killed but is kept alive as a transparent slot
+        // while the reserved applet running in its place finishes (see WindAndDoReserved()).
+        if (applet->is_winding) {
+            if (!applet->child_applets.empty()) {
+                it = std::next(it);
+                continue;
+            }
+
+            const bool unwind = applet->unwind_after_reserved;
+            applet->is_winding = false;
+            applet->unwind_after_reserved = false;
+
+            if (unwind && this->RestartAppletProcessLocked(applet)) {
+                const u64 new_aruid = applet->aruid.pid;
+                const auto next = std::next(it);
+
+                if (new_aruid != aruid) {
+                    auto node = m_applets.extract(it);
+                    node.key() = new_aruid;
+                    m_applets.insert(std::move(node));
+                }
+
+                applet->process->Run();
+                m_event_observer->RequestUpdate();
+                it = next;
+                continue;
+            }
+
+            applet->reserved_applet.reset();
+        }
+
         if (!applet->child_applets.empty()) {
             this->TerminateChildAppletsLocked(applet.get());
             it = std::next(it);
@@ -310,6 +349,28 @@ void WindowSystem::PruneTerminatedAppletsLocked() {
     }
 }
 
+bool WindowSystem::RestartAppletProcessLocked(const std::shared_ptr<Applet>& applet) {
+    if (!ReinitializeProcess(m_system, *applet->process, applet->program_id)) {
+        LOG_ERROR(Service_AM, "Failed to restart winding applet_id={}",
+                  static_cast<u32>(applet->applet_id));
+        return false;
+    }
+
+    applet->aruid.pid = applet->process->GetProcessId();
+    applet->is_process_running = false;
+    applet->is_completed = false;
+
+    applet->hid_registration.RegisterCurrentProcess();
+
+    applet->lifecycle_manager.ResetForRelaunch();
+    applet->is_activity_runnable = false;
+
+    applet->launch_reason.flag = 1;
+
+    m_event_observer->TrackAppletProcess(applet);
+    return true;
+}
+
 bool WindowSystem::LockHomeMenuIntoForegroundLocked() {
     if (m_home_menu == nullptr || !m_home_menu_foreground_locked) {
         m_home_menu_foreground_locked = false;
@@ -349,18 +410,13 @@ void WindowSystem::ReconcileAppletTreeLocked(Applet* applet, bool is_foreground,
 
     std::scoped_lock lk{applet->lock};
 
-    auto dp = ComputeStandardDisplayParams(*applet, is_foreground, input_intercepted);
-    ApplyDisplayParams(*applet, dp);
-
-    const bool inherited_foreground = applet->is_process_running && is_foreground;
-    const auto visible_state =
-        inherited_foreground ? ActivityState::ForegroundVisible : ActivityState::BackgroundVisible;
-    const auto obscured_state = inherited_foreground ? ActivityState::ForegroundObscured
-                                                     : ActivityState::BackgroundObscured;
-
     bool child_obscures = false;
     for (const auto& child : applet->child_applets) {
         std::scoped_lock lk2{child->lock};
+        if (child->is_winding) {
+            child_obscures = true;
+            break;
+        }
         const auto mode = child->library_applet_mode;
         if (child->is_process_running && child->window_visible &&
             (mode == LibraryAppletMode::AllForeground ||
@@ -371,6 +427,16 @@ void WindowSystem::ReconcileAppletTreeLocked(Applet* applet, bool is_foreground,
     }
 
     const bool is_obscured = child_obscures || !applet->window_visible;
+
+    auto dp = ComputeStandardDisplayParams(*applet, is_foreground, input_intercepted, is_obscured);
+    ApplyDisplayParams(*applet, dp);
+
+    const bool inherited_foreground = applet->is_process_running && is_foreground;
+    const auto visible_state =
+        inherited_foreground ? ActivityState::ForegroundVisible : ActivityState::BackgroundVisible;
+    const auto obscured_state = inherited_foreground ? ActivityState::ForegroundObscured
+                                                     : ActivityState::BackgroundObscured;
+
     const auto current_state = applet->lifecycle_manager.GetActivityState();
 
     if (is_obscured && current_state != obscured_state) {

@@ -89,6 +89,49 @@ std::string RemoveFriend(u64 pid);
 // Pushes the console nickname so friends and games see the account's name, not "Player".
 void PushProfileName(const std::string& name);
 
+// A player as seen in the current lobby or in the recent-encounters list. The server never
+// includes an IP address in either. avatar_url identifies whether the player has a picture;
+// fetch the bytes with GetAvatarByPid, which reconstructs the request path from pid rather than
+// trusting this field as a request target.
+struct LobbyPlayer {
+    u64 pid = 0;
+    std::string name;
+    bool known = false; // false when pid isn't a known Nextendo account (can't add/report)
+    std::string avatar_url;
+    std::string friend_code;
+    bool host = false;
+    bool is_me = false;
+    std::string title_id;
+    std::string seen_at; // RFC3339 UTC; empty when not applicable (current lobby members)
+};
+
+struct Lobby {
+    bool in_lobby = false;
+    std::string title_id;
+    std::string type;
+    std::string state;      // raw label from the game server; not for display
+    std::string state_code; // "searching" | "matched" | "" if the game server didn't classify
+    u64 id = 0;
+    int count = 0;
+    int max = 0;
+    std::vector<LobbyPlayer> players;
+};
+
+// The lobby the account is in right now, and who else is in it.
+Lobby GetMyLobby();
+
+// The last players encountered online, most recent first.
+std::vector<LobbyPlayer> GetRecentPlayers();
+
+// Downloads a player's avatar (base64 JPEG). Public, unauthenticated endpoint; the account token
+// is never attached. Empty on failure or if the player has no avatar set.
+std::string GetAvatarByPid(u64 pid);
+
+// Reports a player. The server refuses if the account never actually shared a lobby with pid.
+// Returns an empty string on success, else an error code ("not_encountered", "quota", or a
+// message fit to show the user).
+std::string ReportPlayer(u64 pid, const std::string& reason, const std::string& comment);
+
 // Publishes this player's presence so friends see them online and, for titles that use it,
 // joinable. app_id is the running title id; empty when nothing is running. app_name is the
 // display name already resolved locally (e.g. from NACP) so a friend can show it even without
@@ -98,22 +141,22 @@ void PushPresence(s32 status, const std::string& app_field, const std::string& a
 
 // Downloads the BCAT schedule seed (a zip of vsdata/coopdata/fesdata) for titles that need one
 // locally to go online (Splatoon 2). title_id_hex is 16 uppercase hex digits. Empty on failure.
+//
+// Always fetches the full zip rather than relying on a conditional GET (If-Modified-Since):
+// this endpoint's Last-Modified handling isn't reliable enough to trust as the sole freshness
+// signal (Ryujinx-Nextendo hits the same server and has the same finding), so the caller should
+// hash the returned bytes with HashBcatSeedHex and compare against what's locally installed.
 std::vector<u8> DownloadBcatSeed(const std::string& title_id_hex);
 
-struct BcatSeedCheck {
-    bool not_modified = false;   // true: server confirmed no change since if_modified_since
-    std::string last_modified;   // server's current Last-Modified; store this and send it back
-    std::vector<u8> zip_bytes;   // populated only when not_modified is false and the GET succeeded
-};
-
-// Same seed as DownloadBcatSeed, but conditional: pass the Last-Modified value stored from a
-// previous call (empty if none stored yet) and the server answers 304 instead of resending the
-// zip when nothing changed, so a stale local rotation schedule doesn't stick around forever.
-BcatSeedCheck DownloadBcatSeedIfNewer(const std::string& title_id_hex,
-                                      const std::string& if_modified_since);
+// Lowercase hex SHA-256 of the given bytes, for comparing a freshly downloaded BCAT seed zip
+// against the hash of what's currently installed locally.
+std::string HashBcatSeedHex(const std::vector<u8>& data);
 
 // Public, unauthenticated. Maps lowercase-hex title id -> currently connected player count.
 std::map<std::string, int> GetOnlineCounts();
+
+// Public, unauthenticated. Total players in Nazi Zombies Portable's own nextendo-nzp server.
+int GetNzpOnlineCount();
 
 // Downloads this title's cloud save. title_id_hex is 16 hex digits. nullopt when there is no
 // cloud save stored yet, the account can't use cloud saves (guest), or the request failed.

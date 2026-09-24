@@ -148,6 +148,18 @@ void LifecycleManager::OnOperationAndPerformanceModeChanged() {
     this->SignalSystemEventIfNeeded();
 }
 
+void LifecycleManager::ResetForRelaunch() {
+    m_unordered_messages.clear();
+
+    m_activity_state = ActivityState::BackgroundVisible;
+    m_requested_focus_state = FocusState{};
+    m_acknowledged_focus_state = FocusState{};
+    m_has_focus_state_changed = true;
+
+    m_suspend_mode = SuspendMode::NoOverride;
+    m_forced_suspend = false;
+}
+
 void LifecycleManager::SignalSystemEventIfNeeded() {
     // Check our cached value for the system event.
     const bool applet_message_available = m_applet_message_available;
@@ -367,6 +379,10 @@ bool LifecycleManager::UpdateRequestedFocusState() {
     if (new_state != m_requested_focus_state) {
         // Mark the focus state as ready for update.
         m_requested_focus_state = new_state;
+
+        if (m_is_application) {
+            m_has_focus_state_changed = true;
+        }
 
         // We changed the focus state.
         return true;

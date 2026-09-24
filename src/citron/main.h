@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QPushButton>
@@ -48,6 +49,7 @@ class QLabel;
 class MultiplayerState;
 class NextendoAccountDialog;
 class NextendoController;
+class NextendoRoomOverlay;
 class NextendoToast;
 class QPushButton;
 class QProgressDialog;
@@ -160,6 +162,8 @@ public:
     bool NextendoByamlInstalled(u64 title_id) const;
     bool NextendoByamlSkipped(u64 title_id) const;
     bool NextendoByamlDownloadEnabled() const;
+    void InstallSsbuSkylineMods(u64 program_id);
+    void InstallMk8dCountryFlag(u64 program_id);
     bool IsConfiguring() const {
         return m_is_configuring;
     }
@@ -459,6 +463,16 @@ private:
     NextendoController* nextendo_controller = nullptr;
     NextendoToast* nextendo_toast = nullptr;
     QDialog* nextendo_signin_dialog = nullptr;
+    NextendoAccountDialog* nextendo_account_dialog_instance = nullptr;
+    QString pending_chat_invite_room_id;
+    // The room itself lives in this persistent floating overlay (not tied to any
+    // menu/toast click's lifetime), same pattern as multiplayer_room_overlay below
+    // but for Nextendo chat and not gated on emulation running. The launcher
+    // dialog (Create/Join picker) is transient and only shown when not already
+    // in a room.
+    NextendoRoomOverlay* nextendo_room_overlay = nullptr;
+    void OpenNextendoChatWindow(const QString& auto_join_room_id = {}, u64 invite_pid = 0,
+                                const QString& invite_name = {});
     OverlayDialog* shutdown_dialog{};
     PerformanceOverlay* performance_overlay{};
     MultiplayerRoomOverlay* multiplayer_room_overlay{};
@@ -497,6 +511,30 @@ private:
     void NextendoByamlMarkSkipped(u64 title_id) const;
     bool NextendoByamlDownload(u64 title_id);
     void RunNextendoByamlDownloadWithProgress(u64 title_id);
+
+    struct SsbuModInstallFailure {
+        std::string display_name;
+        std::string reason;
+        std::string release_page_url;
+    };
+    struct SsbuModInstallOutcome {
+        std::vector<std::string> installed;
+        std::vector<SsbuModInstallFailure> failed;
+        bool backup_made = false;
+        std::filesystem::path backup_path;
+    };
+    SsbuModInstallOutcome InstallSsbuSkylineModsBlocking(u64 program_id);
+    void RunSsbuSkylineModsInstallWithProgress(u64 program_id);
+
+    struct Mk8dCountryFlagOutcome {
+        bool success = false;
+        std::string error;
+        std::string release_page_url;
+        std::string detected_version;
+    };
+    Mk8dCountryFlagOutcome InstallMk8dCountryFlagBlocking(u64 program_id,
+                                                          std::string country_code);
+    void RunMk8dCountryFlagInstallWithProgress(u64 program_id, const std::string& country_code);
 
     bool user_flag_cmd_line = false;
     bool auto_paused = false;

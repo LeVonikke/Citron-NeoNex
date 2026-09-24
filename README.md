@@ -2,7 +2,7 @@
 
 ![C++](https://img.shields.io/badge/C%2B%2B-blue) ![Status](https://img.shields.io/badge/status-active-brightgreen) ![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
-A fork of the [Citron](https://git.citron-emu.org/citron/emu) with two
+A fork of the [Citron Neo](https://github.com/citron-neo/emulator) with two
 purposes:
 
 1. **Nextendo Network online play** — connect a Nextendo Network account and play supported titles
@@ -14,7 +14,7 @@ purposes:
 > **This is a work in progress. Expect bugs.**
 >
 > Online support is new, incomplete, and only lightly tested — largely by one person, on one
-> machine, against one game. Things will break. If you hit a problem, please
+> machine, against multiple games. Things will break. If you hit a problem, please
 > **[open an issue](../../issues)** and include:
 >
 > - your `citron_log.txt` (Linux: `~/.local/share/citron/log/citron_log.txt`)

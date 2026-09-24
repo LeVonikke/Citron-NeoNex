@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <exception>
@@ -18,6 +20,7 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/loader/nextendo_s3_patches.h"
 #include "core/loader/nso.h"
 #include "core/memory.h"
 
@@ -178,6 +181,41 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+    }
+
+    // [Nextendo] Built-in NPLN patches (certificate-pinning bypass, peer hostname fix) run
+    // unconditionally here, independent of should_patch_nso above: they must apply even when no
+    // mod patches exist, and must never go through the mod-patch path at all, since Splatoon 3
+    // refuses to boot with any mod enabled (see main.cpp) and these patches need to survive that
+    // ban rather than be blocked by it.
+    constexpr std::array<u64, 6> kNplnPatchableTitles{{
+        0x0100C2500FC20000ULL, // Splatoon 3
+        0x010015100B514000ULL, // Super Mario Bros. Wonder
+        0x0100C9A00ECE6000ULL, // Nintendo 64 - Nintendo Classics
+        0x0100C6F01C4F8000ULL, // METAL GEAR SOLID: Peace Walker - Master Collection Version
+        0x0100F9F00C696000ULL, // Crash Team Racing Nitro-Fueled
+        0x01006FD0080B2000ULL, // Overcooked! 2
+    }};
+    if (pm && std::find(kNplnPatchableTitles.begin(), kNplnPatchableTitles.end(),
+                        pm->GetTitleID()) != kNplnPatchableTitles.end()) {
+        std::span<u8> patchable_section(program_image.data() + module_start,
+                                        program_image.size() - module_start);
+        std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
+        std::memcpy(pi_header.data(), &nso_header, sizeof(NSOHeader));
+        std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
+                    patchable_section.size());
+
+        pi_header = Loader::NextendoS3Patches::ApplyIfMatch(nso_header.build_id,
+                                                            std::move(pi_header), name);
+
+        if (pi_header.size() >= sizeof(NSOHeader) &&
+            pi_header.size() - sizeof(NSOHeader) == patchable_section.size()) {
+            std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(),
+                      patchable_section.data());
+        } else {
+            LOG_ERROR(Loader, "[Nextendo] NPLN built-in patch changed the image size "
+                              "unexpectedly; skipped");
+        }
     }
 
 #ifdef HAS_NCE

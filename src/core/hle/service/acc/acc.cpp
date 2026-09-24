@@ -14,10 +14,13 @@
 
 #include "common/common_types.h"
 #include "common/fs/file.h"
+#include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/nextendo_account.h"
+#include "common/nextendo_avatar.h"
+#include "common/nextendo_compatible_titles.h"
 #include "common/settings.h"
 #include <ranges>
 #include "common/stb.h"
@@ -209,7 +212,34 @@ std::string SignRs256(std::string_view signing_input) {
     return signature;
 }
 
-std::string BuildIdToken() {
+std::string GetInstalledTitleVersion(Core::System& system) {
+    const u64 program_id = system.GetApplicationProcessProgramID();
+    if (program_id == 0) {
+        return {};
+    }
+    const FileSys::PatchManager pm{program_id, system.GetFileSystemController(),
+                                   system.GetContentProvider()};
+    const auto metadata = pm.GetControlMetadata();
+    return metadata.first != nullptr ? metadata.first->GetVersionString() : std::string{};
+}
+
+u64 ConfiguredTestPid() {
+    const std::string pid_setting = Settings::values.nextendo_pid.GetValue();
+    if (!pid_setting.empty()) {
+        try {
+            return std::stoull(pid_setting);
+        } catch (...) {}
+    }
+    const char* pid_env = std::getenv("NEXTENDO_PID");
+    if (pid_env && *pid_env) {
+        try {
+            return std::stoull(pid_env);
+        } catch (...) {}
+    }
+    return 0;
+}
+
+std::string BuildIdToken(const std::string& installed_version) {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
@@ -218,11 +248,43 @@ std::string BuildIdToken() {
         fmt::format(R"({{"alg":"RS256","kid":"{}","typ":"id_token","jku":"{}"}})", BaasKeyId,
                     BaasJku);
 
+    // [Nextendo] Ride the signed nx2 token in the "nnex" claim so the auth server can
+    // cryptographically bind this NEX login to the account (anti-impersonation).
+    std::string nnex_claim;
+    if (Common::NextendoAccount::IsLinked()) {
+        const std::string tok = Common::NextendoAccount::GetToken();
+        if (!tok.empty()) {
+            nnex_claim = fmt::format(R"("nnex":"{}",)", tok);
+        }
+    } else if (const u64 test_pid = ConfiguredTestPid(); test_pid != 0) {
+        // Unsigned test identity; NPLN servers only honour it in the bare-PID test range.
+        nnex_claim = fmt::format(R"("npid":"{}",)", test_pid);
+    }
+
+    // [Nextendo] The console's own nnAccount module expects a "nintendo" claim dictionary
+    // with device metadata (dt, pc, di, sn, ist) -- without it, nnAccount's local schema
+    // check rejects an otherwise well-formed, correctly-signed token even though the server
+    // side has nothing to complain about. Matches Ryujinx-Nextendo's own fix for the exact
+    // same shape of failure (their commit message: "the console receives HTTP 200 but
+    // rejects the body because the JWT schema doesn't match what nnAccount expects").
+    // Reuses the same device id for both the top-level "di" and the nested one, matching
+    // Ryujinx-Nextendo's own token (a single deviceId feeding both places).
+    const std::string device_id = RandomHex(0x10);
+    const std::string nintendo_claim = fmt::format(
+        R"("nintendo":{{"dt":"NX Prod 1","pc":"HAC","di":"{}","sn":"XAW10000000000","ist":false}},)",
+        device_id);
+
+    std::string tv_claim;
+    if (!installed_version.empty()) {
+        tv_claim = fmt::format(R"("tv":"{}",)", installed_version);
+    }
+
     const std::string payload = fmt::format(
         R"({{"sub":"{}","aud":"{}","iss":"{}","typ":"id_token","iat":{},"exp":{},"jku":"{}",)"
-        R"("jti":"{}","di":"{}","sn":"XAW10000000000","bs:did":"{}","hm":true}})",
+        R"("jti":"{}","di":"{}","sn":"XAW10000000000","bs:did":"{}",{}{}{}"hm":true}})",
         RandomHex(0x10), BaasAudience, BaasIssuer, now, now + 3 * 60 * 60, BaasJku,
-        Common::UUID::MakeRandom().FormattedString(), RandomHex(0x10), RandomHex(0x10));
+        Common::UUID::MakeRandom().FormattedString(), device_id, RandomHex(0x10),
+        nintendo_claim, nnex_claim, tv_claim);
 
     const std::string signing_input =
         Base64UrlEncode(header) + "." + Base64UrlEncode(payload);
@@ -230,18 +292,28 @@ std::string BuildIdToken() {
     return signing_input + "." + SignRs256(signing_input);
 }
 
-std::vector<u8> GetIdTokenBytes() {
+std::vector<u8> GetIdTokenBytes(Core::System& system) {
     static std::mutex mutex;
     static std::vector<u8> cached;
     static std::chrono::steady_clock::time_point expiry{};
+    static u64 cached_generation = 0;
+    static std::string cached_version;
+    static u64 cached_test_pid = 0;
 
     std::lock_guard lock{mutex};
 
+    const u64 generation = Common::NextendoAccount::GetGeneration();
+    const std::string installed_version = GetInstalledTitleVersion(system);
+    const u64 test_pid = ConfiguredTestPid();
     const auto now = std::chrono::steady_clock::now();
-    if (cached.empty() || now >= expiry) {
-        const std::string token = BuildIdToken();
+    if (cached.empty() || now >= expiry || generation != cached_generation ||
+        installed_version != cached_version || test_pid != cached_test_pid) {
+        const std::string token = BuildIdToken(installed_version);
         cached.assign(token.begin(), token.end());
         expiry = now + std::chrono::hours{2};
+        cached_generation = generation;
+        cached_version = installed_version;
+        cached_test_pid = test_pid;
         LOG_INFO(Service_ACC, "[Nextendo] Issued a signed BAAS id_token ({} bytes)", cached.size());
     }
 
@@ -256,6 +328,25 @@ constexpr std::size_t THUMBNAIL_SIZE = 0x24000;
 static std::filesystem::path GetImagePath(const Common::UUID& uuid) {
     return Common::FS::GetCitronPath(Common::FS::CitronPath::NANDDir) /
            fmt::format("system/save/8000000000000010/su/avators/{}.jpg", uuid.FormattedString());
+}
+
+static void SeedImageFromNextendoIfMissing(const Common::UUID& uuid) {
+    const auto path = GetImagePath(uuid);
+    if (Common::FS::Exists(path)) {
+        return;
+    }
+    if (!Common::NextendoAccount::IsLinked()) {
+        return;
+    }
+    const auto jpeg = Common::NextendoAvatar::GetSelfJPEG();
+    if (jpeg.empty()) {
+        return;
+    }
+    void(Common::FS::CreateParentDirs(path));
+    Common::FS::IOFile out(path, Common::FS::FileAccessMode::Write, Common::FS::FileType::BinaryFile);
+    if (out.IsOpen()) {
+        void(out.Write(jpeg));
+    }
 }
 
 static void JPGToMemory(void* context, void* data, int len) {
@@ -309,12 +400,13 @@ public:
             {113, nullptr, "GetServiceEntryRequirementCacheForOnlinePlay"}, // 6.1.0+
             {120, nullptr, "GetNintendoAccountId"},
             {121, nullptr, "CalculateNintendoAccountAuthenticationFingerprint"}, // 9.0.0+
-            {130, nullptr, "GetNintendoAccountUserResourceCache"},
+            {130, &IManagerForSystemService::GetNintendoAccountUserResourceCache, "GetNintendoAccountUserResourceCache"},
             {131, nullptr, "RefreshNintendoAccountUserResourceCacheAsync"},
             {132, nullptr, "RefreshNintendoAccountUserResourceCacheAsyncIfSecondsElapsed"},
             {133, nullptr, "GetNintendoAccountVerificationUrlCache"}, // 9.0.0+
             {134, nullptr, "RefreshNintendoAccountVerificationUrlCache"}, // 9.0.0+
             {135, nullptr, "RefreshNintendoAccountVerificationUrlCacheAsyncIfSecondsElapsed"}, // 9.0.0+
+            {136, &IManagerForSystemService::GetNintendoAccountUserResourceCache, "GetNintendoAccountUserResourceCache"}, // 19.0.0+
             {140, nullptr, "GetNetworkServiceLicenseCache"}, // 5.0.0+
             {141, nullptr, "RefreshNetworkServiceLicenseCacheAsync"}, // 5.0.0+
             {142, nullptr, "RefreshNetworkServiceLicenseCacheAsyncIfSecondsElapsed"}, // 5.0.0+
@@ -348,6 +440,24 @@ private:
     Result LoadIdTokenCache() {
         LOG_WARNING(Service_ACC, "(STUBBED) called");
         R_SUCCEED();
+    }
+
+    void GetNintendoAccountUserResourceCache(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_ACC, "[Nextendo] GetNintendoAccountUserResourceCache called");
+
+        const u64 pid = account_id.Hash();
+        std::vector<u8> nas_user_base(0x68, 0);
+        std::memcpy(nas_user_base.data(), &pid, sizeof(pid));
+        ctx.WriteBuffer(nas_user_base, 0);
+
+        if (ctx.CanWriteBuffer(1)) {
+            std::vector<u8> unknown_out_buffer(ctx.GetWriteBufferSize(1), 0);
+            ctx.WriteBuffer(unknown_out_buffer, 1);
+        }
+
+        IPC::ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.PushRaw<u64>(pid);
     }
 
     Result GetNetworkServiceLicenseCacheEx(Out<u32> out_license, Out<s64> out_expiration) {
@@ -612,6 +722,8 @@ protected:
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
 
+        SeedImageFromNextendoIfMissing(user_id);
+
         const Common::FS::IOFile image(GetImagePath(user_id), Common::FS::FileAccessMode::Read,
                                        Common::FS::FileType::BinaryFile);
         if (!image.IsOpen()) {
@@ -638,6 +750,8 @@ protected:
         LOG_DEBUG(Service_ACC, "called");
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
+
+        SeedImageFromNextendoIfMissing(user_id);
 
         const Common::FS::IOFile image(GetImagePath(user_id), Common::FS::FileAccessMode::Read,
                                        Common::FS::FileType::BinaryFile);
@@ -817,7 +931,7 @@ public:
     ~EnsureTokenIdCacheAsyncInterface() = default;
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        const std::vector<u8> token_bytes = GetIdTokenBytes();
+        const std::vector<u8> token_bytes = GetIdTokenBytes(system);
         LOG_INFO(Service_ACC, "[Nextendo] Providing BAAS ID token in async interface ({} bytes)",
                  token_bytes.size());
 
@@ -1022,22 +1136,36 @@ public:
 
 private:
     u64 GetEffectivePid() const {
-        if (const u64 linked = Common::NextendoAccount::GetPid(); linked != 0) {
-            return linked;
+        const u64 raw_pid = []() -> u64 {
+            if (const u64 linked = Common::NextendoAccount::GetPid(); linked != 0) {
+                return linked;
+            }
+            return ConfiguredTestPid();
+        }();
+
+        if (raw_pid == 0) {
+            return 0xcafe;
         }
-        std::string pid_setting = Settings::values.nextendo_pid.GetValue();
-        if (!pid_setting.empty()) {
-            try {
-                return std::stoull(pid_setting);
-            } catch (...) {}
+
+        // [Nextendo] Version gate: refuse to present a real PID for a title whose installed
+        // version doesn't match what Nextendo's servers require, reusing the exact same
+        // server-side refusal as "no account linked" (0xcafe is not a real registered
+        // account, so the gated server rejects it) rather than inventing a new failure mode.
+        // Keeps outdated clients off the servers entirely -- reduces load from clients that
+        // can't speak the wire format the server expects, and keeps the playerbase from
+        // fragmenting across versions.
+        const u64 program_id = system.GetApplicationProcessProgramID();
+        if (Nextendo::CompatibleTitles::Table().contains(program_id)) {
+            const std::string installed_version = GetInstalledTitleVersion(system);
+            if (!Nextendo::CompatibleTitles::IsVersionOk(program_id, installed_version)) {
+                LOG_WARNING(Service_ACC,
+                            "[Nextendo] Refusing online PID: installed version doesn't match "
+                            "what this title requires for online play");
+                return 0xcafe;
+            }
         }
-        const char* pid_env = std::getenv("NEXTENDO_PID");
-        if (pid_env && *pid_env) {
-            try {
-                return std::stoull(pid_env);
-            } catch (...) {}
-        }
-        return 0xcafe;
+
+        return raw_pid;
     }
 
     void CheckAvailability(HLERequestContext& ctx) {
@@ -1071,7 +1199,7 @@ private:
     }
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        const std::vector<u8> token_bytes = GetIdTokenBytes();
+        const std::vector<u8> token_bytes = GetIdTokenBytes(system);
         LOG_INFO(Service_ACC, "[Nextendo] Providing BAAS ID token ({} bytes)", token_bytes.size());
 
         ctx.WriteBuffer(token_bytes);
@@ -1302,6 +1430,7 @@ Result Module::Interface::InitializeApplicationInfoBase() {
         application_info.application_type = ApplicationType::GameCard;
         break;
     case FileSys::StorageId::Host:
+    case FileSys::StorageId::NandSystem:
     case FileSys::StorageId::NandUser:
     case FileSys::StorageId::SdCard:
     case FileSys::StorageId::None: // Citron specific, differs from hardware

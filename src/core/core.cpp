@@ -35,7 +35,9 @@
 
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/nextendo_account.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/string_util.h"
@@ -268,9 +270,17 @@ struct System::Impl {
 
         local_clock->SetCurrentTime(new_time);
 
+        // [Nextendo] Must SetCurrentTime before GetSystemClockContext, not after: the context
+        // this persists is what StandardNetworkSystemClockCore::IsAccuracySufficient() later
+        // measures elapsed time against (see standard_network_system_clock_core.cpp). Capturing
+        // it first grabbed whatever stale/uninitialized context predated this sync (real
+        // hardware and Ryujinx-Nextendo both set-then-get here), so the persisted
+        // steady_time_point never reflected an actually-just-synced clock -- every session
+        // looked like network time hadn't been accurate for a very long time, even though
+        // SetCurrentTime just aligned it to the real current time a line later.
+        network_clock->SetCurrentTime(new_time);
         network_clock->GetSystemClockContext(&context);
         settings_service->SetNetworkSystemClockContext(context);
-        network_clock->SetCurrentTime(new_time);
     }
 
     void Run() {
@@ -441,6 +451,9 @@ struct System::Impl {
             room_member->SendGameInfo(game_info);
         }
 
+        Common::NextendoAccount::WriteGuestBridge(
+            Common::FS::GetCitronPath(Common::FS::CitronPath::SDMCDir));
+
         status = SystemResultStatus::Success;
         return status;
     }
@@ -455,15 +468,22 @@ struct System::Impl {
 
         if (gpu_core) {
             gpu_core->NotifyShutdown();
-            gpu_core->ShutdownThread();
         }
 
         stop_event.request_stop();
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
 
-        kernel.SuspendEmulation(true);
+        // CloseServices() needs each service's own thread to still be schedulable -- and, for
+        // anything touching nvdrv/vi/nvnflinger, the GPU thread still alive -- to notice the
+        // stop request and exit. SuspendEmulation(true) suspends every registered KProcess's
+        // threads (including each service's dedicated one) and ShutdownThread() tears down the
+        // GPU thread, so both have to come after.
         kernel.CloseServices();
+        if (gpu_core) {
+            gpu_core->ShutdownThread();
+        }
+        kernel.SuspendEmulation(true);
         kernel.ShutdownCores();
 
         // Reset the cheat engine BEFORE the service manager is torn down.

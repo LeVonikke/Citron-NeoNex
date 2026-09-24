@@ -88,6 +88,8 @@
 #include "citron/util/confetti.h"
 #include "citron/util/controller_navigation.h"
 #include "citron/util/cup_shuffle_widget.h"
+#include "web_service/mk8d_country_flags.h"
+#include "web_service/ssbu_mod_installer.h"
 #include "citron/util/dice_widget.h"
 #include "citron/util/plinko_widget.h"
 #include "citron/util/steam_grid_db.h"
@@ -1215,6 +1217,9 @@ GameList::GameList(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
     case 2:
         carousel_view->SetBackdropTheme(CinematicCarousel::BackdropTheme::None);
         break;
+    case 3:
+        carousel_view->SetBackdropTheme(CinematicCarousel::BackdropTheme::Reactive);
+        break;
     default:
         carousel_view->SetBackdropTheme(CinematicCarousel::BackdropTheme::Gradient);
         break;
@@ -1230,6 +1235,9 @@ GameList::GameList(std::shared_ptr<FileSys::VfsFilesystem> vfs_,
             break;
         case 2:
             carousel_view->SetBackdropTheme(CinematicCarousel::BackdropTheme::None);
+            break;
+        case 3:
+            carousel_view->SetBackdropTheme(CinematicCarousel::BackdropTheme::Reactive);
             break;
         default:
             carousel_view->SetBackdropTheme(CinematicCarousel::BackdropTheme::Gradient);
@@ -3301,6 +3309,14 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
         main_window->NextendoByamlDownloadEnabled()) {
         download_online_schedule = context_menu.addAction(tr("Download Online Schedule"));
     }
+    QAction* install_ssbu_mods = nullptr;
+    if (main_window && WebService::SkylineMods::IsSsbuTitleId(program_id)) {
+        install_ssbu_mods = context_menu.addAction(tr("Install/Update Skyline Mods"));
+    }
+    QAction* install_mk8d_country_flag = nullptr;
+    if (main_window && WebService::Mk8dCountryFlags::IsMk8dTitleId(program_id)) {
+        install_mk8d_country_flag = context_menu.addAction(tr("Set Country Flag..."));
+    }
     QAction* start_game = context_menu.addAction(tr("Start Game"));
     QAction* start_game_global =
         context_menu.addAction(tr("Start Game without Custom Configuration"));
@@ -3308,10 +3324,7 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
     QAction* open_save_location = context_menu.addAction(tr("Open Save Data Location"));
     QAction* open_nand_location = context_menu.addAction(tr("Open NAND Location"));
     QAction* open_file_location = context_menu.addAction(tr("Open File Location"));
-    QAction* open_bcat_location = nullptr;
-    if (main_window && main_window->NextendoByamlRequired(program_id)) {
-        open_bcat_location = context_menu.addAction(tr("Open BCAT Location"));
-    }
+    QAction* open_bcat_location = context_menu.addAction(tr("Open BCAT Location"));
     QAction* set_custom_save_path = context_menu.addAction(tr("Set Custom Save Path"));
     QAction* remove_custom_save_path = context_menu.addAction(tr("Revert to NAND Save Path"));
     QAction* disable_mirroring = context_menu.addAction(tr("Disable Mirroring"));
@@ -3621,6 +3634,20 @@ void GameList::AddGamePopup(QMenu& context_menu, const QModelIndex& index, u64 p
             }
         });
     }
+    if (install_ssbu_mods) {
+        connect(install_ssbu_mods, &QAction::triggered, [this, program_id]() {
+            if (main_window) {
+                main_window->InstallSsbuSkylineMods(program_id);
+            }
+        });
+    }
+    if (install_mk8d_country_flag) {
+        connect(install_mk8d_country_flag, &QAction::triggered, [this, program_id]() {
+            if (main_window) {
+                main_window->InstallMk8dCountryFlag(program_id);
+            }
+        });
+    }
     connect(start_game, &QAction::triggered, [this, index]() { ValidateEntry(index); });
     connect(start_game_global, &QAction::triggered, [this, path_str]() {
         emit BootGame(QString::fromStdString(path_str), StartGameType::Global);
@@ -3894,6 +3921,26 @@ void GameListSearchField::RetranslateUI() {
 
 QStandardItemModel* GameList::GetModel() const {
     return item_model;
+}
+
+QString GameList::GetGamePath(u64 program_id) const {
+    for (int i = 0; i < item_model->rowCount(); ++i) {
+        QStandardItem* folder = item_model->item(i, 0);
+        if (!folder || folder->data(GameListItem::TypeRole).value<GameListItemType>() ==
+                           GameListItemType::AddDir) {
+            continue;
+        }
+        for (int j = 0; j < folder->rowCount(); ++j) {
+            QStandardItem* game_item = folder->child(j, 0);
+            if (game_item &&
+                game_item->data(GameListItem::TypeRole).value<GameListItemType>() ==
+                    GameListItemType::Game &&
+                game_item->data(GameListItemPath::ProgramIdRole).toULongLong() == program_id) {
+                return game_item->data(GameListItemPath::FullPathRole).toString();
+            }
+        }
+    }
+    return {};
 }
 
 void GameList::PopulateAsync(QVector<UISettings::GameDir>& game_dirs, bool is_smart_update) {

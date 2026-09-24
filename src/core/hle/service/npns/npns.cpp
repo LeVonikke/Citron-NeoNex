@@ -39,12 +39,12 @@ public:
             {15, nullptr, "UnsubscribeTopicByAccount"},
             {16, nullptr, "DownloadSubscriptionList"},
             {17, nullptr, "UnknownCmd17"},
-            {21, nullptr, "CreateToken"},
+            {21, C<&INpnsSystem::CreateToken>, "CreateToken"},
             {22, nullptr, "CreateTokenWithApplicationId"},
             {23, nullptr, "DestroyToken"},
             {24, nullptr, "DestroyTokenWithApplicationId"},
             {25, nullptr, "QueryIsTokenValid"},
-            {26, nullptr, "ListenToMyApplicationId"},
+            {26, C<&INpnsSystem::ListenToMyApplicationId>, "ListenToMyApplicationId"},
             {27, nullptr, "DestroyTokenAll"},
             {28, nullptr, "CreateTokenWithName"},
             {29, nullptr, "DestroyTokenWithName"},
@@ -94,9 +94,9 @@ public:
             {155, nullptr, "CreateTokenAsyncWithApplicationId"},
             {156, nullptr, "CreateTokenWithNameAsync"},
             {161, C<&INpnsSystem::GetRequestChangeStateCancelEvent>, "GetRequestChangeStateCancelEvent"},
-            {162, nullptr, "RequestChangeStateForceTimedWithCancelEvent"},
-            {201, nullptr, "RequestChangeStateForceTimed"},
-            {202, nullptr, "RequestChangeStateForceAsync"},
+            {162, C<&INpnsSystem::RequestChangeStateForceTimedWithCancelEvent>, "RequestChangeStateForceTimedWithCancelEvent"},
+            {201, C<&INpnsSystem::RequestChangeStateForceTimed>, "RequestChangeStateForceTimed"},
+            {202, C<&INpnsSystem::RequestChangeStateForceAsync>, "RequestChangeStateForceAsync"},
             {203, nullptr, "UnknownCmd203"},
             {301, nullptr, "GetPassword"},
             {302, nullptr, "GetAllImmigration"},
@@ -144,14 +144,45 @@ private:
         R_SUCCEED();
     }
 
-    Result GetRequestChangeStateCancelEvent(OutCopyHandle<Kernel::KReadableEvent> out_event) {
+    Result GetRequestChangeStateCancelEvent(OutCopyHandle<Kernel::KEvent> out_event) {
         LOG_INFO(Service_NPNS, "called");
-        *out_event = &get_request_change_state_cancel_event->GetReadableEvent();
+        *out_event = get_request_change_state_cancel_event;
+        R_SUCCEED();
+    }
+
+    // [Nextendo] These three were nullptr, which throws a guest-visible fatal (2010-0212) rather
+    // than a normal IPC error -- QLaunch's "Update" button on the Friends viewer calls this
+    // family to force an immediate push-service state refresh, so pressing it threw an error
+    // dialog every time. citron has no real push-notification backend behind this yet, so this
+    // is a plain success stub like the other unknown-signature NPNS commands above, not a full
+    // implementation -- it just stops the crash rather than driving a real state change.
+    Result RequestChangeStateForceTimedWithCancelEvent() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result RequestChangeStateForceTimed() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result RequestChangeStateForceAsync() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
         R_SUCCEED();
     }
 
     Result ListenToByName() {
         LOG_DEBUG(Service_NPNS, "(STUBBED) called.");
+        R_SUCCEED();
+    }
+
+    Result ListenToMyApplicationId() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result CreateToken() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
         R_SUCCEED();
     }
 
@@ -173,10 +204,10 @@ public:
             {5, C<&INpnsUser::GetReceiveEvent>, "GetReceiveEvent"},
             {7, nullptr, "GetStateChangeEvent"},
             {8, C<&INpnsUser::ListenToByName>, "ListenToByName"},
-            {21, nullptr, "CreateToken"},
+            {21, C<&INpnsUser::CreateToken>, "CreateToken"},
             {23, nullptr, "DestroyToken"},
             {25, nullptr, "QueryIsTokenValid"},
-            {26, nullptr, "ListenToMyApplicationId"},
+            {26, C<&INpnsUser::ListenToMyApplicationId>, "ListenToMyApplicationId"},
             {101, nullptr, "Suspend"},
             {102, nullptr, "Resume"},
             {103, C<&INpnsUser::GetState>, "GetState"},
@@ -217,6 +248,16 @@ private:
     Result GetState(Out<u32> out_state) {
         LOG_INFO(Service_NPNS, "called");
         *out_state = 0;
+        R_SUCCEED();
+    }
+
+    Result ListenToMyApplicationId() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
+        R_SUCCEED();
+    }
+
+    Result CreateToken() {
+        LOG_WARNING(Service_NPNS, "(STUBBED) called");
         R_SUCCEED();
     }
 

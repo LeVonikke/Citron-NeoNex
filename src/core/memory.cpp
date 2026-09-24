@@ -25,12 +25,14 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -47,6 +49,33 @@ bool ShouldLogUnmappedAccess() {
     static std::atomic<u64> count{0};
     const u64 n = count.fetch_add(1, std::memory_order_relaxed);
     return n < 20 || (n % 100000) == 0;
+}
+
+// Diagnostic: dump the guest module/offset backtrace the first time this happens, since
+// unmapped writes are otherwise silently no-op'd with no indication of which module caused it.
+//
+// CurrentPhysicalCoreIndex() silently clamps to NUM_CPU_CORES - 1 when the calling context
+// isn't a recognized core thread (unlike CurrentScheduler(), which returns null in that same
+// situation), so it can hand back a real but WRONG ArmInterface here instead of failing loudly.
+// Ask the current KThread which core it's actually pinned to instead -- that can't misattribute
+// the backtrace to the wrong thread.
+void LogUnmappedWriteBacktraceOnce(Core::System& system) {
+    static std::atomic<bool> done{false};
+    if (done.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    auto& process = Kernel::GetCurrentProcess(system.Kernel());
+    const s32 core_index = Kernel::GetCurrentCoreId(system.Kernel());
+    if (core_index < 0 || static_cast<std::size_t>(core_index) >= Core::Hardware::NUM_CPU_CORES) {
+        LOG_ERROR(HW_Memory, "Unmapped write backtrace: no valid core for current thread (core={})",
+                  core_index);
+        return;
+    }
+    if (auto* arm = process.GetArmInterface(static_cast<std::size_t>(core_index))) {
+        arm->LogBacktrace(&process);
+    } else {
+        LOG_ERROR(HW_Memory, "Unmapped write backtrace: no ARM interface for core {}", core_index);
+    }
 }
 } // namespace
 
@@ -293,13 +322,14 @@ struct Memory::Impl {
                         const std::size_t size) {
         return WalkBlock(
             dest_addr, size,
-            [dest_addr, size](const std::size_t copy_amount,
+            [this, dest_addr, size](const std::size_t copy_amount,
                               const Common::ProcessAddress current_vaddr) {
                 if (ShouldLogUnmappedAccess()) {
                     LOG_ERROR(HW_Memory,
                           "Unmapped WriteBlock @ 0x{:016X} (start address = 0x{:016X}, size = {})",
                           GetInteger(current_vaddr), GetInteger(dest_addr), size);
                 }
+                LogUnmappedWriteBacktraceOnce(system);
             },
             [&](const std::size_t copy_amount, u8* const dest_ptr) {
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
@@ -755,10 +785,11 @@ struct Memory::Impl {
         } else {
             const bool crosses_page = (addr_c1 & 4095) + sizeof(T) > 4096;
             if (!crosses_page) {
-                if (auto const ptr_c1 = GetPointerImpl(addr_c1, [addr_c1] {
+                if (auto const ptr_c1 = GetPointerImpl(addr_c1, [this, addr_c1] {
                     if (ShouldLogUnmappedAccess()) {
                         LOG_ERROR(HW_Memory, "Unmapped Write{} @ 0x{:016X}", sizeof(T) * 8, addr_c1);
                     }
+                    LogUnmappedWriteBacktraceOnce(system);
                 }, [&] {
                     HandleRasterizerWrite(addr_c1, sizeof(T));
                 }); ptr_c1) {

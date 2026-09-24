@@ -5,6 +5,7 @@
 #include <dynarmic/interface/code_page.h>
 #include "common/profiling.h"
 #include "common/settings.h"
+#include "core/arm/debug.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
@@ -111,13 +112,15 @@ public:
             static constexpr u64 ICACHE_LINE_SIZE = 64;
 
             const u64 cache_line_start = value & ~(ICACHE_LINE_SIZE - 1);
-            m_parent.InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);
+            // Homebrew NROs (Jak & Daxter) get all 4 cores and threads migrate between them, so a
+            // core-local invalidate leaves stale translations on the others.
+            Core::InvalidateInstructionCacheRange(m_process, cache_line_start, ICACHE_LINE_SIZE);
             break;
         }
         case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoU:
+        case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoUInnerSharable:
             m_parent.ClearInstructionCache();
             break;
-        case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoUInnerSharable:
         default:
             LOG_DEBUG(Core_ARM, "Unprocesseed instruction cache operation: {}", op);
             break;
@@ -142,6 +145,14 @@ public:
                 LOG_CRITICAL(Core_ARM,
                              "Fatal: fault at {:#016x} (consecutive={}), suspending thread",
                              pc, m_consecutive_faults);
+                m_parent.LogBacktrace(m_process);
+
+                // A call through a null pointer is recoverable: resume at the return address so
+                // the caller continues instead of the thread dying. Fixed up in RunThread, where
+                // touching the jit is safe.
+                if (pc < 0x1000) {
+                    m_parent.m_recover_null_exec = true;
+                }
             }
 
             ReturnException(pc, PrefetchAbort);
@@ -233,8 +244,9 @@ public:
     const bool m_check_memory_access{};
     u32 m_consecutive_faults{};
     static constexpr u64 MinimumRunCycles = 10000U;
+    static constexpr u64 kNoCachedCodePage = ~u64{0};
     Dynarmic::CodePage cached_code_page;
-    u64 last_code_addr = 0;
+    u64 last_code_addr = kNoCachedCodePage;
 };
 
 std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(Common::PageTable* page_table,
@@ -393,6 +405,27 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(Common::PageTable* pa
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     CITRON_PROFILE_SCOPE("Dynarmic64::Run");
     m_jit->ClearExclusiveState();
+
+    // Bounded so a pathological caller cannot spin here forever.
+    for (u32 recoveries = 0; recoveries < 64; ++recoveries) {
+        const HaltReason hr = TranslateHaltReason(m_jit->Run());
+        if (!m_recover_null_exec) {
+            return hr;
+        }
+        m_recover_null_exec = false;
+
+        Kernel::Svc::ThreadContext ctx;
+        this->GetContext(ctx);
+        if (ctx.lr < 0x1000) {
+            return hr;
+        }
+        LOG_WARNING(Core_ARM, "Skipping call through null pointer, resuming at {:#016x}", ctx.lr);
+        ctx.pc = ctx.lr;
+        this->SetContext(ctx);
+        m_jit->ClearExclusiveState();
+    }
+
+    m_recover_null_exec = false;
     return TranslateHaltReason(m_jit->Run());
 }
 
@@ -494,11 +527,14 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 
 void ArmDynarmic64::ClearInstructionCache() {
     CITRON_PROFILE_SCOPE("Dynarmic64::ClearCache");
+    // MemoryReadCode()'s page snapshot goes stale as soon as the guest rewrites that page.
+    m_cb->last_code_addr = DynarmicCallbacks64::kNoCachedCodePage;
     m_jit->ClearCache();
 }
 
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     CITRON_PROFILE_SCOPE("Dynarmic64::InvalidateCacheRange");
+    m_cb->last_code_addr = DynarmicCallbacks64::kNoCachedCodePage;
     m_jit->InvalidateCacheRange(addr, size);
 }
 

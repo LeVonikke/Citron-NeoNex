@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -10,6 +11,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/nextendo_account.h"
+#include "common/settings.h"
 #include "common/string_util.h"
 
 namespace Common::NextendoAccount {
@@ -23,9 +25,36 @@ u64 g_pid = 0;
 std::string g_username;
 std::string g_friend_code;
 std::string g_token;
+u64 g_generation = 0;
 
 std::filesystem::path FilePath() {
     return FS::GetCitronPath(FS::CitronPath::ConfigDir) / "nextendo_account.txt";
+}
+
+// Same order acc.cpp's GetEffectivePid() uses, so a test instance presents one identity to
+// both the emulated account service and the game servers.
+u64 TestPid() {
+    const std::string setting = Settings::values.nextendo_pid.GetValue();
+    if (!setting.empty()) {
+        try {
+            return std::stoull(setting);
+        } catch (...) {
+        }
+    }
+    if (const char* env = std::getenv("NEXTENDO_PID"); env != nullptr && *env != '\0') {
+        try {
+            return std::stoull(env);
+        } catch (...) {
+        }
+    }
+    return 0;
+}
+
+std::string TestUsername(u64 pid) {
+    if (const char* env = std::getenv("NEXTENDO_USERNAME"); env != nullptr && *env != '\0') {
+        return env;
+    }
+    return fmt::format("player{}", pid); // what the servers name an unverified PID
 }
 
 // Caller holds g_mutex.
@@ -104,6 +133,12 @@ std::string GetToken() {
     return g_token;
 }
 
+u64 GetGeneration() {
+    std::lock_guard lock{g_mutex};
+    EnsureLoaded();
+    return g_generation;
+}
+
 void Save(u64 pid, std::string_view username, std::string_view friend_code,
           std::string_view token) {
     std::lock_guard lock{g_mutex};
@@ -112,6 +147,7 @@ void Save(u64 pid, std::string_view username, std::string_view friend_code,
     g_username = username;
     g_friend_code = friend_code;
     g_token = token;
+    ++g_generation;
     WriteFile();
 }
 
@@ -122,7 +158,40 @@ void Clear() {
     g_username.clear();
     g_friend_code.clear();
     g_token.clear();
+    ++g_generation;
     void(FS::RemoveFile(FilePath()));
+}
+
+void WriteGuestBridge(const std::filesystem::path& sdmc_root) {
+    std::lock_guard lock{g_mutex};
+    EnsureLoaded();
+
+    u64 pid = g_pid;
+    std::string username = g_username;
+    std::string token = g_token;
+
+    // A second local instance has no account to mirror -- there is only one browser sign-in per
+    // machine -- so fall back to the same test-PID sources acc's GetEffectivePid() already
+    // honours. The game servers accept a bare PID in this range while signed tokens are not yet
+    // mandatory, which is what makes two-player testing on one PC possible at all.
+    if (pid == 0) {
+        pid = TestPid();
+        if (pid != 0) {
+            username = TestUsername(pid);
+            token = std::to_string(pid);
+        }
+    }
+
+    const auto bridge_path = sdmc_root / "config" / "nextendo" / "session.txt";
+    if (pid == 0) {
+        void(FS::RemoveFile(bridge_path)); // not linked -- clear any stale bridge
+        return;
+    }
+
+    void(FS::CreateParentDirs(bridge_path));
+    const std::string contents =
+        fmt::format("pid={}\nusername={}\ntoken={}\n", pid, username, token);
+    void(FS::WriteStringToFile(bridge_path, FS::FileType::TextFile, contents));
 }
 
 } // namespace Common::NextendoAccount

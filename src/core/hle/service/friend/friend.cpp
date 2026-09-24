@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <mutex>
 #include <queue>
+#include <fmt/format.h>
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/uuid.h"
@@ -100,6 +102,40 @@ bool FixupInGameFlag(std::string& app_field) {
     return true;
 }
 
+// [Nextendo] ARMS reports raw presence status 1 (Online) even while actively hosting/queued
+// for a match, so friends never see it as OnlinePlay and the Friends List UI buckets them as
+// "online, nothing joinable" without ever reading JoinMode at all (confirmed by decompiling
+// the ARMS update binary: the friends-list categorization only inspects JoinMode when the
+// caller's presence status is already 2). ARMS's app_field uses the same null-delimited
+// key/value scheme as Splatoon 2's, just different keys (SessionId/JoinMode/HasPassword
+// instead of Mode/InGame). JoinMode is 0 only when there is no active session; any of 1-4
+// means a real session exists, so bump the status the same way FixupInGameFlag does for
+// Splatoon 2's InGame flag.
+bool IsArmsSessionActive(const std::string& app_field) {
+    size_t pos = 0;
+    while (pos < app_field.size()) {
+        const size_t end = app_field.find('\0', pos);
+        const size_t token_end = end == std::string::npos ? app_field.size() : end;
+        if (token_end == pos) {
+            break;
+        }
+        const std::string key = app_field.substr(pos, token_end - pos);
+        pos = token_end + 1;
+        if (pos >= app_field.size()) {
+            break;
+        }
+        const size_t value_end = app_field.find('\0', pos);
+        const size_t value_token_end = value_end == std::string::npos ? app_field.size() : value_end;
+        const std::string value = app_field.substr(pos, value_token_end - pos);
+        pos = value_token_end + 1;
+
+        if (key == "JoinMode") {
+            return value == "1" || value == "2" || value == "3" || value == "4";
+        }
+    }
+    return false;
+}
+
 // The account server hands out NEX PIDs; the guest wants a Uid. Derive one deterministically so a
 // friend keeps the same Uid across launches. The high half matches what Ryujinx uses.
 Common::UUID UidForPid(u64 pid) {
@@ -108,6 +144,53 @@ Common::UUID UidForPid(u64 pid) {
     const u64 high = 0x1100000000000000ULL;
     std::memcpy(raw.data() + 8, &high, sizeof(high));
     return Common::UUID{raw};
+}
+
+// Mirrors FriendImpl's proven-working layout (UUID + pid + 0x21-byte nickname) rather than
+// acc::ProfileBase (UUID + timestamp), which is an unrelated local-account struct this was
+// wrongly modeled on -- GetProfileList resolved real data (confirmed live) but still rendered
+// garbage in-game, meaning the wire layout, not the data, was wrong.
+#pragma pack(push, 1)
+struct ProfileImpl {
+    Common::UUID user_uuid;          // 0x00
+    u64 network_user_id;             // 0x10
+    std::array<char, 0x21> nickname; // 0x18
+    std::array<u8, 7> padding;       // 0x39, aligns to 0x40
+};
+static_assert(sizeof(ProfileImpl) == 0x40, "ProfileImpl has the wrong size");
+#pragma pack(pop)
+
+// [Nextendo] Resolves a pid to a display name for GetProfileList/GetProfileExtraList: the local
+// account itself (via NextendoAccount, not covered by the friends cache) or an actual Nextendo
+// friend. Strangers (e.g. a balloon owner you're not friends with) aren't resolvable here --
+// titles that also carry a plain name string on the wire (Odyssey's DataStoreSearchBalloonResult.
+// ownerName) fall back to that; this only covers the profile-lookup path.
+bool ResolveProfileName(u64 pid, std::string& out_name) {
+    if (Common::NextendoAccount::IsLinked() && Common::NextendoAccount::GetPid() == pid) {
+        out_name = Common::NextendoAccount::GetUsername();
+        return true;
+    }
+    const auto entries = Common::NextendoFriends::Get();
+    const auto it = std::find_if(entries.begin(), entries.end(),
+                                  [pid](const auto& e) { return e.pid == pid; });
+    if (it != entries.end()) {
+        out_name = it->name;
+        return true;
+    }
+    return false;
+}
+
+std::optional<ProfileImpl> MakeProfile(u64 pid) {
+    std::string name;
+    if (!ResolveProfileName(pid, name)) {
+        return std::nullopt;
+    }
+    ProfileImpl out{};
+    out.user_uuid = UidForPid(pid);
+    out.network_user_id = pid;
+    const auto length = std::min(name.size(), out.nickname.size() - 1);
+    std::memcpy(out.nickname.data(), name.data(), length);
+    return out;
 }
 
 FriendImpl MakeFriend(const Common::NextendoFriends::Entry& entry) {
@@ -258,6 +341,17 @@ public:
         service_context.CloseEvent(completion_event);
     }
 
+    // Real hardware answers most of these commands asynchronously and signals the shared
+    // completion event once the underlying (often network-backed) work finishes; the caller
+    // waits on that event before treating the data as ready. citron's stubs finish instantly,
+    // but individually forgetting to signal completion_event in any one of them leaves the
+    // guest polling forever, so signal it centrally after every command in this class instead.
+    Result HandleSyncRequest(Kernel::KServerSession& session, HLERequestContext& context) override {
+        const Result result = ServiceFrameworkBase::HandleSyncRequest(session, context);
+        completion_event->Signal();
+        return result;
+    }
+
     void GetCompletionEvent(HLERequestContext& ctx) {
         LOG_DEBUG(Service_Friend, "GetCompletionEvent called");
         IPC::ResponseBuilder rb{ctx, 2, 1};
@@ -271,7 +365,18 @@ public:
 
         u32 count = 0;
         if (offset == 0 && ctx.CanWriteBuffer()) {
-            const auto entries = Common::NextendoFriends::Get();
+            // [Nextendo] Splatoon 3 asks for its friend list exactly once, early in boot, and
+            // never asks again -- unlike NEX titles, which poll this repeatedly from their own
+            // online thread (where blocking would stall PRUDP acks and the server would declare
+            // a communication error, so they keep the plain non-blocking Get()). If the
+            // frontend's background refresh hasn't populated the cache yet by the time Splatoon
+            // 3's one-shot request lands, it's stuck with zero friends for the whole session.
+            // Give that one call a short, bounded wait instead. Matches Ryujinx-Nextendo's own
+            // fix here (NextendoFriends.GetWarm), which measured this exact race.
+            constexpr u64 SplatoonThreeTitleId = 0x0100C2500FC20000ULL;
+            const auto entries = system.GetApplicationProcessProgramID() == SplatoonThreeTitleId
+                                     ? Common::NextendoFriends::GetWarm(2000)
+                                     : Common::NextendoFriends::Get();
             const auto capacity = ctx.GetWriteBufferNumElements<u64>();
             std::vector<u64> ids;
             for (const auto& entry : entries) {
@@ -424,6 +529,13 @@ private:
     Kernel::KEvent* completion_event;
 };
 
+// [Nextendo] Registry of every live INotificationService so NotifyFriendsListUpdated() (called
+// from the frontend's background friend-poll thread, not an HLE dispatch thread) can reach them.
+// Guarded separately from each instance's own lock so registration/teardown never has to wait on
+// whatever that instance's HLE thread happens to be doing.
+static std::mutex g_notification_registry_lock;
+static std::vector<class INotificationService*> g_notification_services;
+
 class INotificationService final : public ServiceFramework<INotificationService> {
 public:
     explicit INotificationService(Core::System& system_, Common::UUID uuid_)
@@ -440,10 +552,31 @@ public:
         RegisterHandlers(functions);
 
         notification_event = service_context.CreateEvent("INotificationService:NotifyEvent");
+
+        notifications.push(SizedNotificationInfo{NotificationTypes::HasUpdatedFriendsList, {}, 0});
+        states.has_updated_friends = true;
+        notification_event->Signal();
+
+        std::scoped_lock lk{g_notification_registry_lock};
+        g_notification_services.push_back(this);
     }
 
     ~INotificationService() override {
+        {
+            std::scoped_lock lk{g_notification_registry_lock};
+            std::erase(g_notification_services, this);
+        }
         service_context.CloseEvent(notification_event);
+    }
+
+    // [Nextendo] Called from NotifyFriendsListUpdated(), potentially from a different thread than
+    // this instance's own HLE dispatch -- guarded by instance_lock, unlike the ctor/dtor-only
+    // registry lock above.
+    void PushFriendsListUpdated() {
+        std::scoped_lock lk{instance_lock};
+        notifications.push(SizedNotificationInfo{NotificationTypes::HasUpdatedFriendsList, {}, 0});
+        states.has_updated_friends = true;
+        notification_event->Signal();
     }
 
 private:
@@ -457,6 +590,7 @@ private:
 
     void Clear(HLERequestContext& ctx) {
         LOG_DEBUG(Service_Friend, "called");
+        std::scoped_lock lk{instance_lock};
         while (!notifications.empty()) {
             notifications.pop();
         }
@@ -468,6 +602,7 @@ private:
 
     void Pop(HLERequestContext& ctx) {
         LOG_DEBUG(Service_Friend, "called");
+        std::scoped_lock lk{instance_lock};
 
         if (notifications.empty()) {
             LOG_ERROR(Service_Friend, "No notifications in queue!");
@@ -520,10 +655,18 @@ private:
     Common::UUID uuid;
     KernelHelpers::ServiceContext service_context;
 
+    std::mutex instance_lock;
     Kernel::KEvent* notification_event;
     std::queue<SizedNotificationInfo> notifications;
     States states{};
 };
+
+void NotifyFriendsListUpdated() {
+    std::scoped_lock lk{g_notification_registry_lock};
+    for (auto* service : g_notification_services) {
+        service->PushFriendsListUpdated();
+    }
+}
 
 class IDaemonSuspendSessionService final : public ServiceFramework<IDaemonSuspendSessionService> {
 public:
@@ -664,6 +807,11 @@ void IFriendService::UpdateUserPresence(HLERequestContext& ctx) {
             LOG_INFO(Service_Friend,
                      "[Nextendo] Corrected InGame=0->1 in presence blob for a resolved private "
                      "battle host (natf/natm confirmed via NAT-check)");
+        } else if (IsArmsSessionActive(app_field)) {
+            status = std::max<s32>(status, Common::NextendoFriends::PresenceOnlinePlay);
+            LOG_INFO(Service_Friend,
+                     "[Nextendo] ARMS JoinMode indicates an active session; bumping status to "
+                     "OnlinePlay (raw status floors at Online otherwise)");
         }
         Common::NextendoFriends::SetLocalPresence(status, app_field);
         LOG_INFO(Service_Friend, "[Nextendo] UpdateUserPresence status={} -> {} app_field={}",
@@ -724,23 +872,118 @@ void IFriendService::Cancel(HLERequestContext& ctx) {
 }
 
 void IFriendService::UpdateFriendInfo(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) UpdateFriendInfo called");
+    IPC::RequestParser rp{ctx};
+    const auto uuid = rp.PopRaw<Common::UUID>();
+
+    // [Nextendo] This used to return Success while writing NOTHING into its out buffer. Any game
+    // that resolves friend details this way -- taking the ids GetFriendListIds already handed it
+    // and asking here for the actual name/presence/app-field data -- got the ids back with zero
+    // real data, so the friends screen stayed empty even though the id list itself was correct.
+    // Matches a real, confirmed Ryujinx-Nextendo bug for this exact method (Splatoon 3's "Amis"
+    // screen staying empty despite GetFriendListIds already succeeding). The requested ids are
+    // the INPUT here and the resolved details the OUTPUT, one entry per requested id, in the SAME
+    // order -- an id we can't resolve gets a zeroed (is_valid=0) entry rather than being skipped,
+    // otherwise the caller mis-pairs the remaining ids with the wrong friends.
+    // [Nextendo] Defensive: only trust an input buffer that's actually present, and hard-cap the
+    // element count regardless of what the size math says -- a previous version of this fix
+    // trusted ctx.ReadBuffer(0)'s size unconditionally and hung the emulator (unbounded
+    // std::vector<u64> allocation) the first time this call's real buffer layout didn't match
+    // what was assumed. A real friend list can never exceed a few hundred entries.
+    constexpr std::size_t MaxRequestedIds = 300;
+    std::vector<u64> requested_ids;
+    if (ctx.CanReadBuffer(0)) {
+        const auto requested_ids_raw = ctx.ReadBuffer(0);
+        const auto id_count = std::min(requested_ids_raw.size() / sizeof(u64), MaxRequestedIds);
+        requested_ids.resize(id_count);
+        if (id_count > 0) {
+            std::memcpy(requested_ids.data(), requested_ids_raw.data(), id_count * sizeof(u64));
+        }
+    }
+
+    const auto entries = Common::NextendoFriends::Get();
+    const auto capacity = std::min(ctx.GetWriteBufferNumElements<FriendImpl>(), MaxRequestedIds);
+    const auto out_count = std::min(requested_ids.size(), capacity);
+
+    std::vector<FriendImpl> info(out_count);
+    for (std::size_t i = 0; i < out_count; ++i) {
+        const auto wanted = requested_ids[i];
+        const auto it = std::find_if(entries.begin(), entries.end(),
+                                     [wanted](const auto& e) { return e.pid == wanted; });
+        info[i] = it != entries.end() ? MakeFriend(*it) : FriendImpl{};
+    }
+
+    if (!info.empty()) {
+        ctx.WriteBuffer(info);
+    }
+
+    LOG_INFO(Service_Friend, "[Nextendo] UpdateFriendInfo uuid=0x{} requested={} -> {} resolved",
+             uuid.RawString(), requested_ids.size(), out_count);
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
 }
 
+namespace {
+
+// [Nextendo] The caller identifies the target friend by the same synthetic Uid FriendImpl handed
+// it (see UidForPid above) -- reverse it back to the raw pid so we can look the entry up in the
+// cache. Exact inverse of UidForPid: the low 8 bytes are the pid, verbatim.
+u64 PidForUid(const Common::UUID& uid) {
+    u64 pid{};
+    std::memcpy(&pid, uid.uuid.data(), sizeof(pid));
+    return pid;
+}
+
+} // namespace
+
 void IFriendService::GetFriendProfileImage(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) GetFriendProfileImage called");
+    // [Nextendo] Was a hardcoded zero-size stub, so every friend tile fell back to the "?"
+    // placeholder icon regardless of whether the account server actually had a picture for them.
+    // NextendoFriends::Entry now carries the already-decoded JPEG bytes (see PollFriends), so
+    // this just has to find the right entry and hand them back.
+    IPC::RequestParser rp{ctx};
+    const auto uuid = rp.PopRaw<Common::UUID>();
+    const auto pid = PidForUid(uuid);
+
+    const auto entries = Common::NextendoFriends::Get();
+    const auto it = std::find_if(entries.begin(), entries.end(),
+                                 [pid](const auto& e) { return e.pid == pid; });
+
+    u32 size = 0;
+    if (it != entries.end() && !it->image.empty()) {
+        ctx.WriteBuffer(it->image);
+        size = static_cast<u32>(it->image.size());
+    }
+
+    LOG_INFO(Service_Friend, "[Nextendo] GetFriendProfileImage uuid=0x{} -> {} bytes",
+             uuid.RawString(), size);
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
-    rb.Push<u32>(0); // Image size
+    rb.Push<u32>(size);
 }
 
 void IFriendService::GetFriendProfileImageWithImageSize(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) GetFriendProfileImageWithImageSize called");
+    // [Nextendo] Same lookup as GetFriendProfileImage; the requested/max size argument is
+    // advisory on real hardware (a resize hint), and the account server only ever gives us one
+    // resolution anyway, so it's not worth threading through a second image variant for.
+    IPC::RequestParser rp{ctx};
+    const auto uuid = rp.PopRaw<Common::UUID>();
+    const auto pid = PidForUid(uuid);
+
+    const auto entries = Common::NextendoFriends::Get();
+    const auto it = std::find_if(entries.begin(), entries.end(),
+                                 [pid](const auto& e) { return e.pid == pid; });
+
+    u32 size = 0;
+    if (it != entries.end() && !it->image.empty()) {
+        ctx.WriteBuffer(it->image);
+        size = static_cast<u32>(it->image.size());
+    }
+
+    LOG_INFO(Service_Friend, "[Nextendo] GetFriendProfileImageWithImageSize uuid=0x{} -> {} bytes",
+             uuid.RawString(), size);
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
-    rb.Push<u32>(0); // Image size
+    rb.Push<u32>(size);
 }
 
 void IFriendService::EnsureFriendListAvailable(HLERequestContext& ctx) {
@@ -767,18 +1010,51 @@ void IFriendService::EnsureBlockedUserListAvailable(HLERequestContext& ctx) {
     rb.Push(ResultSuccess);
 }
 
-void IFriendService::GetProfileList(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) GetProfileList called");
+namespace {
+// [Nextendo] Same ids-in (buffer 0, u64 pids)/structs-out contract as GetFriendDetailedInfo --
+// only proven-working pattern for this class of call in this codebase, so mirrored here rather
+// than guessing a UUID-keyed format with nothing to test it against.
+void RespondProfileList(HLERequestContext& ctx, const char* name) {
+    constexpr std::size_t MaxRequestedIds = 300;
+    std::vector<u64> requested_ids;
+    if (ctx.CanReadBuffer(0)) {
+        const auto raw = ctx.ReadBuffer(0);
+        const auto id_count = std::min(raw.size() / sizeof(u64), MaxRequestedIds);
+        requested_ids.resize(id_count);
+        if (id_count > 0) {
+            std::memcpy(requested_ids.data(), raw.data(), id_count * sizeof(u64));
+        }
+    }
+
+    const auto capacity = std::min(ctx.GetWriteBufferNumElements<ProfileImpl>(), MaxRequestedIds);
+    std::vector<ProfileImpl> profiles;
+    for (const auto pid : requested_ids) {
+        if (profiles.size() >= capacity) {
+            break;
+        }
+        if (const auto profile = MakeProfile(pid)) {
+            profiles.push_back(*profile);
+        }
+    }
+
+    if (!profiles.empty()) {
+        ctx.WriteBuffer(profiles);
+    }
+
+    LOG_INFO(Service_Friend, "[Nextendo] {} requested={} -> {} resolved", name,
+             requested_ids.size(), profiles.size());
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
-    rb.Push<u32>(0); // Profile count
+    rb.Push<u32>(static_cast<u32>(profiles.size()));
+}
+} // Anonymous namespace
+
+void IFriendService::GetProfileList(HLERequestContext& ctx) {
+    RespondProfileList(ctx, "GetProfileList");
 }
 
 void IFriendService::GetProfileListV2(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) GetProfileListV2 called");
-    IPC::ResponseBuilder rb{ctx, 3};
-    rb.Push(ResultSuccess);
-    rb.Push<u32>(0); // Profile count
+    RespondProfileList(ctx, "GetProfileListV2");
 }
 
 void IFriendService::DeclareOpenOnlinePlaySession(HLERequestContext& ctx) {
@@ -827,10 +1103,39 @@ void IFriendService::GetProfileImageUrlV2(HLERequestContext& ctx) {
 }
 
 void IFriendService::GetFriendDetailedInfo(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) GetFriendDetailedInfo called");
+    // [Nextendo] Same ids-in/details-out contract as GetFriendDetailedInfoV2 below (this is the
+    // pre-20.0.0 command id for the same viewer-detail lookup).
+    constexpr std::size_t MaxRequestedIds = 300;
+    std::vector<u64> requested_ids;
+    if (ctx.CanReadBuffer(0)) {
+        const auto requested_ids_raw = ctx.ReadBuffer(0);
+        const auto id_count = std::min(requested_ids_raw.size() / sizeof(u64), MaxRequestedIds);
+        requested_ids.resize(id_count);
+        if (id_count > 0) {
+            std::memcpy(requested_ids.data(), requested_ids_raw.data(), id_count * sizeof(u64));
+        }
+    }
+
+    const auto entries = Common::NextendoFriends::Get();
+    const auto capacity = std::min(ctx.GetWriteBufferNumElements<FriendImpl>(), MaxRequestedIds);
+    const auto out_count = std::min(requested_ids.size(), capacity);
+
+    std::vector<FriendImpl> info(out_count);
+    for (std::size_t i = 0; i < out_count; ++i) {
+        const auto wanted = requested_ids[i];
+        const auto it = std::find_if(entries.begin(), entries.end(),
+                                     [wanted](const auto& e) { return e.pid == wanted; });
+        info[i] = it != entries.end() ? MakeFriend(*it) : FriendImpl{};
+    }
+
+    if (!info.empty()) {
+        ctx.WriteBuffer(info);
+    }
+
+    LOG_INFO(Service_Friend, "[Nextendo] GetFriendDetailedInfo requested={} -> {} resolved",
+             requested_ids.size(), out_count);
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
-    // TODO [Zephyron]: Needs buffer for FriendDetailedInfo (X, (pid, size))
 }
 
 void IFriendService::SyncFriendList(HLERequestContext& ctx) {
@@ -846,25 +1151,150 @@ void IFriendService::RequestSyncFriendList(HLERequestContext& ctx) {
 }
 
 void IFriendService::GetFriendListForViewer(HLERequestContext& ctx) {
-    const auto count = static_cast<u32>(Common::NextendoFriends::Get().size());
-    LOG_WARNING(Service_Friend, "(partially stubbed) GetFriendListForViewer called -> count={}",
-               count);
+    // [Nextendo] The count-only version of this call left MyPage's Friends viewer showing a
+    // correct "36 friends" header with a permanently empty list underneath -- the same class of
+    // bug UpdateFriendInfo's comment above describes for GetFriendListIds. This is the id-buffer
+    // half of that same two-step viewer flow (ids here, details resolved per-id via
+    // GetFriendDetailedInfoV2 below), so it follows GetFriendListIds's proven pattern exactly.
+    // [Nextendo] TEMP: GetFriendListIds (its game-facing sibling) takes an offset scalar first --
+    // probe for the same here, in case this call is meant to paginate and my always-return-
+    // everything implementation is confusing whatever pagination state the viewer tracks.
+    IPC::RequestParser probe_rp{ctx};
+    const auto probe_offset = probe_rp.Pop<s32>();
+    LOG_INFO(Service_Friend, "[Nextendo] GetFriendListForViewer probe_offset={}", probe_offset);
+
+    u32 count = 0;
+    if (ctx.CanWriteBuffer()) {
+        const auto entries = Common::NextendoFriends::Get();
+        const auto capacity = ctx.GetWriteBufferNumElements<u64>();
+        std::vector<u64> ids;
+        for (const auto& entry : entries) {
+            if (ids.size() >= capacity) {
+                break;
+            }
+            ids.push_back(entry.pid);
+        }
+        if (!ids.empty()) {
+            ctx.WriteBuffer(ids);
+        }
+        count = static_cast<u32>(ids.size());
+    }
+
+    // [Nextendo] TEMP: dump the actual ids handed out here so we can diff them against what
+    // UpdateFriendInfoForViewer later receives back -- matched=1/36 there means the guest is
+    // requesting a mostly-different id set than this call just gave it.
+    std::string ids_dump;
+    if (ctx.CanWriteBuffer()) {
+        const auto entries = Common::NextendoFriends::Get();
+        for (std::size_t i = 0; i < std::min<std::size_t>(entries.size(), 5); ++i) {
+            ids_dump += fmt::format("{} ", entries[i].pid);
+        }
+    }
+    LOG_INFO(Service_Friend, "[Nextendo] GetFriendListForViewer -> {} first5=[{}]", count,
+             ids_dump);
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
     rb.Push<u32>(count);
 }
 
 void IFriendService::UpdateFriendInfoForViewer(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) UpdateFriendInfoForViewer called");
+    // [Nextendo] This, not GetFriendDetailedInfoV2, turns out to be what MyPage's Friends viewer
+    // actually polls per-tile (GetFriendDetailedInfoV2 was only ever seen called with an empty id
+    // buffer). Same ids-in/details-out contract as UpdateFriendInfo/GetFriendDetailedInfo(V2).
+    constexpr std::size_t MaxRequestedIds = 300;
+    std::vector<u64> requested_ids;
+    if (ctx.CanReadBuffer(0)) {
+        const auto requested_ids_raw = ctx.ReadBuffer(0);
+        const auto id_count = std::min(requested_ids_raw.size() / sizeof(u64), MaxRequestedIds);
+        requested_ids.resize(id_count);
+        if (id_count > 0) {
+            std::memcpy(requested_ids.data(), requested_ids_raw.data(), id_count * sizeof(u64));
+        }
+    }
+
+    const auto entries = Common::NextendoFriends::Get();
+    // [Nextendo] TEMP: raw byte capacity of the output buffer the guest actually allocated. If
+    // this isn't a multiple of sizeof(FriendImpl)==0x200, this call's real output struct isn't
+    // FriendImpl at all -- would explain why even a successfully-resolved entry never renders.
+    const auto raw_write_size = ctx.GetWriteBufferSize();
+    const auto capacity = std::min(ctx.GetWriteBufferNumElements<FriendImpl>(), MaxRequestedIds);
+    const auto out_count = std::min(requested_ids.size(), capacity);
+
+    std::vector<FriendImpl> info(out_count);
+    std::size_t matched_count = 0;
+    for (std::size_t i = 0; i < out_count; ++i) {
+        const auto wanted = requested_ids[i];
+        const auto it = std::find_if(entries.begin(), entries.end(),
+                                     [wanted](const auto& e) { return e.pid == wanted; });
+        if (it != entries.end()) {
+            info[i] = MakeFriend(*it);
+            ++matched_count;
+        } else {
+            info[i] = FriendImpl{};
+        }
+    }
+
+    if (!info.empty()) {
+        ctx.WriteBuffer(info);
+    }
+
+    LOG_INFO(Service_Friend,
+             "[Nextendo] UpdateFriendInfoForViewer raw_write_size={} (sizeof(FriendImpl)={}, "
+             "{:.2f} entries worth)",
+             raw_write_size, sizeof(FriendImpl),
+             static_cast<double>(raw_write_size) / sizeof(FriendImpl));
+
+    // [Nextendo] TEMP: dump the actual requested ids to diff against GetFriendListForViewer's
+    // first5 -- "resolved" alone only ever meant "slots written", not "slots that found a real
+    // friend", so it could say 36 even if find_if missed on every single one.
+    std::string req_dump;
+    for (std::size_t i = 0; i < std::min<std::size_t>(requested_ids.size(), 5); ++i) {
+        req_dump += fmt::format("{} ", requested_ids[i]);
+    }
+    LOG_INFO(Service_Friend,
+             "[Nextendo] UpdateFriendInfoForViewer requested={} first5=[{}] matched={}/{} "
+             "cache_size={}",
+             requested_ids.size(), req_dump, matched_count, out_count, entries.size());
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
 }
 
 void IFriendService::GetFriendDetailedInfoV2(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) GetFriendDetailedInfoV2 called");
+    // [Nextendo] Same ids-in/details-out contract as UpdateFriendInfo above (one resolved entry
+    // per requested id, in the same order, zeroed rather than skipped when an id can't be
+    // resolved) -- this is the detail half of the GetFriendListForViewer flow MyPage's Friends
+    // viewer actually uses, so without this the viewer had ids but nothing to show for them.
+    constexpr std::size_t MaxRequestedIds = 300;
+    std::vector<u64> requested_ids;
+    if (ctx.CanReadBuffer(0)) {
+        const auto requested_ids_raw = ctx.ReadBuffer(0);
+        const auto id_count = std::min(requested_ids_raw.size() / sizeof(u64), MaxRequestedIds);
+        requested_ids.resize(id_count);
+        if (id_count > 0) {
+            std::memcpy(requested_ids.data(), requested_ids_raw.data(), id_count * sizeof(u64));
+        }
+    }
+
+    const auto entries = Common::NextendoFriends::Get();
+    const auto capacity = std::min(ctx.GetWriteBufferNumElements<FriendImpl>(), MaxRequestedIds);
+    const auto out_count = std::min(requested_ids.size(), capacity);
+
+    std::vector<FriendImpl> info(out_count);
+    for (std::size_t i = 0; i < out_count; ++i) {
+        const auto wanted = requested_ids[i];
+        const auto it = std::find_if(entries.begin(), entries.end(),
+                                     [wanted](const auto& e) { return e.pid == wanted; });
+        info[i] = it != entries.end() ? MakeFriend(*it) : FriendImpl{};
+    }
+
+    if (!info.empty()) {
+        ctx.WriteBuffer(info);
+    }
+
+    LOG_INFO(Service_Friend, "[Nextendo] GetFriendDetailedInfoV2 requested={} -> {} resolved",
+             requested_ids.size(), out_count);
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
-    // TODO [Zephyron]: Needs buffer for FriendDetailedInfo (X, (pid, size))
 }
 
 void IFriendService::LoadFriendSetting(HLERequestContext& ctx) {
@@ -947,10 +1377,7 @@ void IFriendService::GetBlockedUserListV2(HLERequestContext& ctx) {
 }
 
 void IFriendService::GetProfileExtraList(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) GetProfileExtraList called");
-    IPC::ResponseBuilder rb{ctx, 3};
-    rb.Push(ResultSuccess);
-    rb.Push<u32>(0); // Count
+    RespondProfileList(ctx, "GetProfileExtraList");
 }
 
 void IFriendService::GetRelationship(HLERequestContext& ctx) {
@@ -962,10 +1389,7 @@ void IFriendService::GetRelationship(HLERequestContext& ctx) {
 }
 
 void IFriendService::GetProfileExtraListV2(HLERequestContext& ctx) {
-    LOG_WARNING(Service_Friend, "(STUBBED) GetProfileExtraListV2 called");
-    IPC::ResponseBuilder rb{ctx, 3};
-    rb.Push(ResultSuccess);
-    rb.Push<u32>(0); // Count
+    RespondProfileList(ctx, "GetProfileExtraListV2");
 }
 
 void IFriendService::GetUserPresenceView(HLERequestContext& ctx) {

@@ -3,15 +3,19 @@
 // SPDX-FileCopyrightText: 2026 citron-neo Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cinttypes>
 #include <clocale>
+#include <ctime>
 #include <random>
 #include "citron/theme.h"
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <string_view>
 #include <thread>
 #include "core/hle/service/am/applet_manager.h"
 #include "core/loader/nca.h"
@@ -92,6 +96,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QFile>
 #include <QFileDialog>
 #include <QGuiApplication>
+#include <QComboBox>
+#include <QDialogButtonBox>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QLineEdit>
@@ -159,9 +165,12 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "citron/loading_screen.h"
 #include "citron/main.h"
 #include "citron/nextendo_account_dialog.h"
+#include "citron/nextendo_chat_window.h"
+#include "citron/nextendo_room_overlay.h"
 #include "citron/nextendo_population_dialog.h"
 #include "citron/nextendo_controller.h"
 #include "citron/nextendo_online_counts.h"
+#include "citron/nzp_online_count.h"
 #include "citron/nextendo_population_history.h"
 #include "citron/nextendo_toast.h"
 #include "citron/play_time_manager.h"
@@ -173,7 +182,9 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "citron/util/rainbow_style.h"
 #include "common/settings.h"
 #ifdef ENABLE_WEB_SERVICE
+#include "web_service/mk8d_country_flags.h"
 #include "web_service/nextendo_api.h"
+#include "web_service/ssbu_mod_installer.h"
 #endif
 #include "common/string_util.h"
 #include "common/xci_trimmer.h"
@@ -219,6 +230,9 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 #ifdef CITRON_CRASH_DUMPS
 #include "citron/breakpad.h"
+#endif
+#if defined(__unix__) && !defined(__APPLE__)
+#include "citron/linux_crash_handler.h"
 #endif
 
 using namespace Common::Literals;
@@ -657,6 +671,15 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
 }
 
 GMainWindow::~GMainWindow() {
+    // system is a plain data member, destroyed (along with the RoomNetwork it owns) during
+    // GMainWindow's own implicit member teardown, which runs before Qt's base-class destructor
+    // gets around to deleting Qt-parented children like multiplayer_room_overlay. Left to Qt's
+    // own cleanup order, MultiplayerRoomOverlay::~MultiplayerRoomOverlay (-> DisconnectFromRoom
+    // -> ChatRoom::Shutdown) would run after RoomNetwork is already gone and crash dereferencing
+    // it. Delete it explicitly here, first, while system is still alive.
+    delete multiplayer_room_overlay;
+    multiplayer_room_overlay = nullptr;
+
     delete game_list;
     game_list = nullptr;
     // will get automatically deleted otherwise
@@ -1132,6 +1155,7 @@ public:
                                    "   padding: 1px 8px; font-size: 10pt; "
                                    "   font-family: 'Outfit', 'Inter', sans-serif; "
                                    "}"));
+                widget->adjustSize();
             }
         }
 
@@ -1282,6 +1306,7 @@ void GMainWindow::InitializeWidgets() {
     nextendo_controller = new NextendoController(*system, this, this);
     nextendo_toast = new NextendoToast(this);
     Nextendo::OnlineCounts::Start(this);
+    Nextendo::NzpOnlineCount::Start(this);
     Nextendo::PopulationHistory::Start(this);
 
     // Create status bar
@@ -1330,6 +1355,15 @@ void GMainWindow::InitializeWidgets() {
 
     multiplayer_room_overlay = new MultiplayerRoomOverlay(this);
     multiplayer_room_overlay->hide();
+
+    nextendo_room_overlay = new NextendoRoomOverlay(this, nextendo_controller);
+    connect(nextendo_room_overlay, &NextendoRoomOverlay::InvitePickerRequested, this, [this] {
+        NextendoAccountDialog dialog(nextendo_controller, *system, this,
+                                     NextendoAccountDialog::kFriendsPage);
+        connect(&dialog, &NextendoAccountDialog::InviteToChatRequested, this,
+                [this](u64 pid, const QString& name) { OpenNextendoChatWindow({}, pid, name); });
+        dialog.exec();
+    });
 
     vram_overlay = new VramOverlay(this);
     vram_overlay->hide();
@@ -1689,6 +1723,35 @@ void GMainWindow::InitializeHotkeys() {
             system->GetRenderdocAPI().ToggleCapture();
         }
     });
+
+    // "Exit Fullscreen", "Toggle Framerate Limit" and "Toggle Mouse Panning" read their key
+    // sequence straight out of GRenderWindow::keyPressEvent instead of a QShortcut, so
+    // connect_shortcut (which also registers a QShortcut) doesn't apply to them -- without this,
+    // their controller_shortcut was never created and an assigned controller combo did nothing.
+    const auto connect_controller_only_shortcut = [&]<typename Fn>(const QString& action_name,
+                                                                    const Fn& function) {
+        static const std::string main_window = "Main Window";
+        auto* controller = system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+        const auto* controller_hotkey =
+            hotkey_registry.GetControllerHotkey(main_window, action_name.toStdString(), controller);
+        connect(controller_hotkey, &ControllerShortcut::Activated, this, function,
+                Qt::QueuedConnection);
+    };
+
+    connect_controller_only_shortcut(QStringLiteral("Exit Fullscreen"), [this] {
+        if (emulation_running && ui->action_Fullscreen->isChecked()) {
+            ui->action_Fullscreen->setChecked(false);
+            ToggleFullscreen();
+        }
+    });
+    connect_controller_only_shortcut(QStringLiteral("Toggle Framerate Limit"), [this] {
+        if (system->IsPoweredOn()) {
+            Settings::values.use_speed_limit.SetValue(!Settings::values.use_speed_limit.GetValue());
+        }
+    });
+    connect_controller_only_shortcut(QStringLiteral("Toggle Mouse Panning"), [this] {
+        render_window->SetMousePanningState(!Settings::values.mouse_panning.GetValue());
+    });
 }
 
 void GMainWindow::SetDefaultUIGeometry() {
@@ -1989,10 +2052,46 @@ void GMainWindow::ConnectMenuEvents() {
             nextendo_controller->SignIn();
             return;
         }
-        NextendoAccountDialog(nextendo_controller, this).exec();
+        // Pressing the hotkey again while the dialog is already open closes it instead of
+        // stacking another one on top.
+        if (nextendo_account_dialog_instance) {
+            nextendo_account_dialog_instance->close();
+            return;
+        }
+        NextendoAccountDialog dialog(nextendo_controller, *system, this);
+        nextendo_account_dialog_instance = &dialog;
+        connect(&dialog, &NextendoAccountDialog::InviteToChatRequested, this,
+                [this](u64 pid, const QString& name) { OpenNextendoChatWindow({}, pid, name); });
+        dialog.exec();
+        nextendo_account_dialog_instance = nullptr;
+    });
+    connect(nextendo_toast, &NextendoToast::clicked, this, [this](NextendoToast::Kind kind) {
+        if (!Common::NextendoAccount::IsLinked()) {
+            return;
+        }
+        if (kind == NextendoToast::Kind::Request) {
+            NextendoAccountDialog dialog(nextendo_controller, *system, this,
+                                         NextendoAccountDialog::kFriendsPage);
+            connect(&dialog, &NextendoAccountDialog::InviteToChatRequested, this,
+                    [this](u64 pid, const QString& name) { OpenNextendoChatWindow({}, pid, name); });
+            dialog.exec();
+        } else if (kind == NextendoToast::Kind::ChatRequest) {
+            OpenNextendoChatWindow(pending_chat_invite_room_id);
+        }
     });
     connect(ui->action_Nextendo_Population, &QAction::triggered, this,
             [this] { NextendoPopulationDialog(this).exec(); });
+    // Prototype: no .ui entry yet (still being pitched for real integration), added here
+    // instead of the designer file to keep this easy to pull out later.
+    auto* action_chat_rooms = ui->menu_NexTendo->addAction(tr("Chat Rooms (Prototype)"));
+    connect(action_chat_rooms, &QAction::triggered, this, [this] {
+        if (!Common::NextendoAccount::IsLinked()) {
+            QMessageBox::information(this, tr("Chat Rooms"),
+                                     tr("Sign in to Nextendo Network first."));
+            return;
+        }
+        OpenNextendoChatWindow();
+    });
     connect(ui->action_Nextendo_Sign_In, &QAction::triggered, nextendo_controller,
             &NextendoController::SignIn);
     connect(ui->action_Nextendo_Sign_Out, &QAction::triggered, nextendo_controller,
@@ -2087,6 +2186,37 @@ void GMainWindow::ConnectMenuEvents() {
                 nextendo_toast->Show(tr("Friend Request Sent!"), friend_code, {},
                                      NextendoToast::Kind::RequestSent);
             });
+    connect(nextendo_controller, &NextendoController::ChatInviteReceived, this,
+            [this](const QString& room_id, const QString& room_name, u64 /*from_pid*/,
+                   const QString& from_name) {
+                nextendo_toast->Show(from_name, tr("invited you to \"%1\"").arg(room_name), {},
+                                     NextendoToast::Kind::ChatRequest);
+                pending_chat_invite_room_id = room_id;
+            });
+    connect(nextendo_controller, &NextendoController::ChatInviteSent, this, [this](u64 /*target_pid*/) {
+        nextendo_toast->Show(tr("Chat Invite Sent!"), {}, {}, NextendoToast::Kind::RequestSent);
+    });
+    connect(nextendo_controller, &NextendoController::ChatMemberJoined, this,
+            [this](const QString& /*room_id*/, u64 /*pid*/, const QString& name) {
+                nextendo_toast->Show(name, tr("joined your chat room"), {},
+                                     NextendoToast::Kind::Online);
+            });
+    connect(nextendo_controller, &NextendoController::ChatBanned, this, [this](const QString& reason) {
+        if (nextendo_room_overlay) {
+            nextendo_room_overlay->hide();
+        }
+        QMessageBox::warning(this, tr("Chat Rooms"),
+                             reason.isEmpty()
+                                 ? tr("You have been banned from using this feature.")
+                                 : tr("You have been banned from using this feature.\n\nReason: %1")
+                                       .arg(reason));
+    });
+    connect(nextendo_controller, &NextendoController::QuickStartRequested, this, [this](u64 title_id) {
+        const QString path = game_list->GetGamePath(title_id);
+        if (!path.isEmpty()) {
+            BootGameFromList(path, StartGameType::Normal);
+        }
+    });
     connect(ui->action_Connect_To_Room, &QAction::triggered, multiplayer_state,
             &MultiplayerState::OnDirectConnectToRoom);
     connect(ui->action_Show_Room, &QAction::triggered, multiplayer_state,
@@ -2490,8 +2620,50 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
 
     current_title_id = title_id; // Store ID safely
 
+    // [Nextendo] Splatoon 3 refuses to boot with any mod OR cheat active. Updates/DLC are
+    // unaffected -- those are PatchType::Update/DLC. Matches Ryujinx-Nextendo's own equivalent
+    // check (ModLoader.cs's ModsInterdits): online play there is against real people and the
+    // server can't contradict a modified client -- the console itself computes the shots -- so
+    // Ryujinx's port blocks romfs/romfs.bin/exefs/IPS patches (including global ones) AND cheat
+    // codes/activation for this title alone. Citron's own prior check here only looked at
+    // PatchType::Mod; cheats live in a separate PatchManager::GetCheats() list entirely and
+    // were never checked, so a cheat could still be active while this dialog reported "clean".
+    const bool nextendo_production_active =
+        Settings::values.enable_nextendo.GetValue() &&
+        Settings::values.nextendo_server_ip.GetValue() ==
+            Settings::values.nextendo_server_ip.GetDefault();
+    if (title_id == 0x0100C2500FC20000ULL && nextendo_production_active) {
+        const FileSys::PatchManager pm{title_id, system->GetFileSystemController(),
+                                       system->GetContentProvider()};
+        QStringList active_mods;
+        for (const auto& patch : pm.GetPatches()) {
+            if (patch.enabled && patch.type == FileSys::PatchType::Mod) {
+                active_mods.push_back(QString::fromStdString(patch.name));
+            }
+        }
+        for (const auto& cheat : pm.GetCheats()) {
+            if (cheat.enabled) {
+                active_mods.push_back(tr("%1 (cheat)").arg(QString::fromStdString(cheat.name)));
+            }
+        }
+        if (!active_mods.isEmpty()) {
+            LOG_CRITICAL(Frontend,
+                         "[Nextendo] Refusing to boot Splatoon 3: {} mod(s)/cheat(s) enabled",
+                         active_mods.size());
+            QMessageBox::critical(
+                this, tr("Splatoon 3: mods must be disabled"),
+                tr("Splatoon 3 cannot be launched while any mod or cheat is enabled:\n\n%1\n\n"
+                   "Disable them in the game's Properties > Add-Ons/Cheats tabs and try again. "
+                   "Updates and DLC are not affected.")
+                    .arg(active_mods.join(QStringLiteral("\n"))));
+            return;
+        }
+    }
+
     OfferNextendoByamlDownload(title_id);
-    Nextendo::SaveSync::Pull(*system, title_id);
+    if (Settings::values.nextendo_cloud_sync_enabled.GetValue()) {
+        Nextendo::SaveSync::Pull(*system, title_id);
+    }
 
     if (type == StartGameType::Normal) {
         // Load per game settings if it is a normal boot
@@ -2513,6 +2685,25 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
             LOG_INFO(Frontend,
                      "Applying workaround: forcing single-core mode for Final Fantasy Tactics");
             Settings::values.use_multi_core.SetValue(false);
+        }
+
+        // TEMPORARY: resolution scale above 1x doubles Nextendo online points. Clamp to 1x
+        // until the actual scaling bug is fixed. Remove this block once that's resolved.
+        switch (title_id) {
+        case 0x0100f8f0000a2000ULL: // Splatoon 2 (EU)
+        case 0x01003bc0000a0000ULL: // Splatoon 2 (US)
+        case 0x01003c700009c800ULL: // Splatoon 2 (JP)
+            LOG_INFO(Frontend, "Applying workaround: clamping resolution to 1x for Splatoon 2 "
+                               "(online points scaling bug)");
+            Settings::values.resolution_setup.SetValue(Settings::ResolutionSetup::Res1X);
+            break;
+        case 0x0100C2500FC20000ULL: // Splatoon 3
+            LOG_INFO(Frontend, "Applying workaround: clamping resolution to 1x for Splatoon 3 "
+                               "(same online points scaling bug as Splatoon 2)");
+            Settings::values.resolution_setup.SetValue(Settings::ResolutionSetup::Res1X);
+            break;
+        default:
+            break;
         }
     }
 
@@ -2739,7 +2930,7 @@ void GMainWindow::OnEmulationStopped() {
 #ifdef ENABLE_WEB_SERVICE
     // Only safe past this point: emu_thread has fully exited (no more concurrent guest access to
     // the VFS) and InitializeContentSystem() just rebuilt a fresh save-data factory.
-    {
+    if (Settings::values.nextendo_cloud_sync_enabled.GetValue()) {
         auto save_zip = Nextendo::SaveSync::CaptureForPush(*system, current_title_id);
         if (!save_zip.empty()) {
             std::thread{[title_id = current_title_id, zip = std::move(save_zip)]() mutable {
@@ -2766,9 +2957,6 @@ void GMainWindow::OnEmulationStopped() {
     // The emulation is stopped, so closing the window or not does not matter anymore
     disconnect(render_window, &GRenderWindow::Closed, this, &GMainWindow::OnStopGame);
 
-    // Update the GUI
-    UpdateMenuState();
-
     if (UISettings::IsGamescope()) {
         setFixedSize(1280, 800);
         showMaximized();
@@ -2777,6 +2965,11 @@ void GMainWindow::OnEmulationStopped() {
     render_window->hide();
     loading_screen->hide();
     loading_screen->Clear();
+
+    // Update the GUI -- must run after loading_screen->hide(), since it reads
+    // loading_screen->isVisible() to decide whether Configure should be enabled. Stopping while
+    // still on the "Launching..." screen otherwise leaves Configure permanently disabled.
+    UpdateMenuState();
 
     game_list->show();
     game_list_placeholder->hide();
@@ -4400,6 +4593,24 @@ void GMainWindow::OnSaveConfig() {
 }
 
 void GMainWindow::RefreshGameList() {
+    // [Nextendo] RefreshExternalContent() re-scans Settings::values.external_content_dirs into
+    // the ACTUAL content provider PatchManager uses at boot (GetActiveUpdate/PatchRomFS) --
+    // separate from, and previously never wired to, the game-list scan below (which only feeds
+    // the UI: icons, versions shown in the list/Properties dialog, game_metadata_cache). Before
+    // this call existed anywhere, that real provider was built exactly once, at the very first
+    // CONTENT_READY init, and never again for the process's lifetime: an update/DLC file added
+    // to a tracked folder afterward showed up fine in the game list (which re-scans readily) but
+    // was invisible to the code that actually decides which update to apply when booting --
+    // confirmed directly against a real case (Splatoon 3, update NSP added mid-session): the
+    // update's own content resolved correctly on its own, but the base title's active-update
+    // lookup returned found=false for the entire session, and the game failed to load with
+    // "Program-type NCA contains no executable" because it never saw the update it needed.
+    // Restarting Citron fixed it (fresh initial scan sees the file that's already on disk by
+    // then) -- this makes a plain Refresh Game List do the same thing, without a restart.
+    if (system) {
+        system->RefreshExternalContent();
+    }
+
     if (game_list) {
         game_list->PopulateAsync(UISettings::values.game_dirs);
     }
@@ -5160,17 +5371,32 @@ bool GMainWindow::ExtractZipToDirectory(const std::filesystem::path& zip_path,
 
     std::string powershell_cmd =
         "powershell -NoProfile -NonInteractive -Command \"Expand-Archive -Path \\\"" +
-        zip_path.string() + "\\\" -DestinationPath \\\"" + extract_path.string() + "\\\" -Force\"";
+        zip_path.string() + "\\\" -DestinationPath \\\"" + extract_path.string() +
+        "\\\" -Force 2>&1\"";
 
-    LOG_INFO(Frontend, "Extracting firmware ZIP with PowerShell: {}", powershell_cmd);
+    LOG_INFO(Frontend, "Extracting ZIP with PowerShell: {}", powershell_cmd);
 
-    int result = std::system(powershell_cmd.c_str());
+    // std::system() discards PowerShell's stdout/stderr entirely, so a failure here used to
+    // produce no information beyond "it failed". Use _popen so the actual PowerShell error
+    // (bad zip, path issue, etc.) ends up in the log instead of being thrown away.
+    std::string output;
+    FILE* pipe = _popen(powershell_cmd.c_str(), "r");
+    if (!pipe) {
+        LOG_ERROR(Frontend, "Failed to launch PowerShell for ZIP extraction");
+        return false;
+    }
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+    const int result = _pclose(pipe);
+
     if (result == 0) {
-        LOG_INFO(Frontend, "Firmware ZIP extracted successfully");
+        LOG_INFO(Frontend, "ZIP extracted successfully");
         return true;
     }
 
-    LOG_ERROR(Frontend, "Failed to extract firmware ZIP file");
+    LOG_ERROR(Frontend, "Failed to extract ZIP file (exit code {}): {}", result, output);
     return false;
 #else
     // On other platforms, require libarchive
@@ -5268,11 +5494,20 @@ void GMainWindow::OnInstallFirmwareFromZip() {
 
     // Locate and erase the content of nand/system/Content/registered/*.nca, if any.
     auto sysnand_content_vdir = system->GetFileSystemController().GetSystemNANDContentDirectory();
+    if (sysnand_content_vdir == nullptr) {
+        progress.close();
+        std::filesystem::remove_all(temp_extract_path);
+        QMessageBox::critical(this, tr("Firmware install failed"),
+                              tr("System NAND content directory is unavailable."));
+        return;
+    }
     if (!sysnand_content_vdir->CleanSubdirectoryRecursive("registered")) {
         progress.close();
         std::filesystem::remove_all(temp_extract_path);
         QMessageBox::critical(this, tr("Firmware install failed"),
                               tr("Failed to delete one or more firmware file."));
+        system->GetFileSystemController().InitializeContentSystem(*vfs);
+        OnCheckFirmwareDecryption();
         return;
     }
 
@@ -5306,6 +5541,8 @@ void GMainWindow::OnInstallFirmwareFromZip() {
                 this, tr("Firmware install failed"),
                 tr("Firmware installation cancelled, firmware may be in bad state, "
                    "restart citron or re-install firmware."));
+            system->GetFileSystemController().InitializeContentSystem(*vfs);
+            OnCheckFirmwareDecryption();
             return;
         }
     }
@@ -5317,6 +5554,8 @@ void GMainWindow::OnInstallFirmwareFromZip() {
         progress.close();
         QMessageBox::critical(this, tr("Firmware install failed"),
                               tr("One or more firmware files failed to copy into NAND."));
+        system->GetFileSystemController().InitializeContentSystem(*vfs);
+        OnCheckFirmwareDecryption();
         return;
     }
 
@@ -5338,6 +5577,7 @@ void GMainWindow::OnInstallFirmwareFromZip() {
         QMessageBox::critical(
             this, tr("Firmware integrity verification failed!"),
             tr("Verification failed for the following files:\n\n%1").arg(failed_names));
+        OnCheckFirmwareDecryption();
         return;
     }
 
@@ -5437,10 +5677,18 @@ void GMainWindow::OnInstallFirmware() {
 
     // Locate and erase the content of nand/system/Content/registered/*.nca, if any.
     auto sysnand_content_vdir = system->GetFileSystemController().GetSystemNANDContentDirectory();
+    if (sysnand_content_vdir == nullptr) {
+        progress.close();
+        QMessageBox::critical(this, tr("Firmware install failed"),
+                              tr("System NAND content directory is unavailable."));
+        return;
+    }
     if (!sysnand_content_vdir->CleanSubdirectoryRecursive("registered")) {
         progress.close();
         QMessageBox::critical(this, tr("Firmware install failed"),
                               tr("Failed to delete one or more firmware file."));
+        system->GetFileSystemController().InitializeContentSystem(*vfs);
+        OnCheckFirmwareDecryption();
         return;
     }
 
@@ -5473,6 +5721,8 @@ void GMainWindow::OnInstallFirmware() {
                 this, tr("Firmware install failed"),
                 tr("Firmware installation cancelled, firmware may be in bad state, "
                    "restart citron or re-install firmware."));
+            system->GetFileSystemController().InitializeContentSystem(*vfs);
+            OnCheckFirmwareDecryption();
             return;
         }
     }
@@ -5481,6 +5731,8 @@ void GMainWindow::OnInstallFirmware() {
         progress.close();
         QMessageBox::critical(this, tr("Firmware install failed"),
                               tr("One or more firmware files failed to copy into NAND."));
+        system->GetFileSystemController().InitializeContentSystem(*vfs);
+        OnCheckFirmwareDecryption();
         return;
     }
 
@@ -5502,6 +5754,7 @@ void GMainWindow::OnInstallFirmware() {
         QMessageBox::critical(
             this, tr("Firmware integrity verification failed!"),
             tr("Verification failed for the following files:\n\n%1").arg(failed_names));
+        OnCheckFirmwareDecryption();
         return;
     }
 
@@ -5593,12 +5846,7 @@ void GMainWindow::OnAbout() {
 }
 
 void GMainWindow::OnCheckForUpdates() {
-#ifdef _WIN32
-    // The in-app updater is broken for multiple Windows users right now — point them at the
-    // CI releases page instead until it's fixed. See Updater::UpdaterDialog/UpdaterService for
-    // the disabled flow.
-    QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/CollectingW/CI/releases")));
-#elif defined(CITRON_USE_AUTO_UPDATER)
+#ifdef CITRON_USE_AUTO_UPDATER
     auto* updater_dialog = new Updater::UpdaterDialog(this);
     updater_dialog->setAttribute(Qt::WA_DeleteOnClose);
     updater_dialog->show();
@@ -5798,6 +6046,36 @@ double GMainWindow::GetEmulationSpeed() const {
         return 0.0;
     }
     return last_perf_stats.emulation_speed * 100.0;
+}
+
+void GMainWindow::OpenNextendoChatWindow(const QString& auto_join_room_id, u64 invite_pid,
+                                         const QString& invite_name) {
+    if (!auto_join_room_id.isEmpty()) {
+        // Invite-toast click: we already know the room, skip straight to it.
+        nextendo_room_overlay->JoinRoom(auto_join_room_id);
+        return;
+    }
+    if (invite_pid != 0) {
+        // Friends-list invite: create/reuse our own room, then invite once host is confirmed.
+        nextendo_room_overlay->InviteFriendOnJoin(invite_pid, invite_name);
+        nextendo_room_overlay->ShowOverlay();
+        return;
+    }
+    if (nextendo_room_overlay->IsInRoom()) {
+        nextendo_room_overlay->ShowOverlay();
+        return;
+    }
+
+    // Not in a room yet -- show the Create/Join picker. It closes itself once
+    // the overlay confirms a room was actually joined.
+    auto* launcher = new NextendoChatWindow(this);
+    launcher->setAttribute(Qt::WA_DeleteOnClose);
+    connect(launcher, &NextendoChatWindow::CreateRoomRequested, nextendo_room_overlay,
+            &NextendoRoomOverlay::CreateRoom);
+    connect(launcher, &NextendoChatWindow::JoinRoomRequested, nextendo_room_overlay,
+            &NextendoRoomOverlay::JoinRoom);
+    connect(nextendo_room_overlay, &NextendoRoomOverlay::RoomJoined, launcher, &QDialog::accept);
+    launcher->exec();
 }
 
 void GMainWindow::OnAlbum() {
@@ -6263,7 +6541,6 @@ void GMainWindow::OnMouseActivity() {
 }
 
 void GMainWindow::OnCheckFirmwareDecryption() {
-    system->GetFileSystemController().InitializeContentSystem(*vfs);
     if (!ContentManager::AreKeysPresent()) {
         QMessageBox::warning(this, tr("Derivation Components Missing"),
                              tr("Encryption keys are missing. "
@@ -6823,7 +7100,17 @@ void GMainWindow::UpdateUITheme() {
     if (game_list) {
         game_list->RefreshTheme();
     }
- 
+
+    // UISettings::IsDarkTheme() only reflects the value just published above, so this
+    // has to run after it -- multiplayer_room_overlay is constructed once at startup and
+    // otherwise only repaints via a themeChanged signal that's declared but never emitted.
+    if (multiplayer_room_overlay) {
+        multiplayer_room_overlay->UpdateTheme();
+    }
+    if (nextendo_room_overlay) {
+        nextendo_room_overlay->UpdateTheme();
+    }
+
     m_is_updating_theme = false;
 }
 
@@ -7082,6 +7369,9 @@ int main(int argc, char* argv[]) {
 #ifdef CITRON_CRASH_DUMPS
     Breakpad::InstallCrashHandler();
 #endif
+#if defined(__unix__) && !defined(__APPLE__)
+    LinuxCrashHandler::Install();
+#endif
 
     Common::DetachedTasks detached_tasks;
     Common::ConfigureNvidiaEnvironmentFlags();
@@ -7140,12 +7430,40 @@ int main(int argc, char* argv[]) {
         std::filesystem::path(QCoreApplication::applicationDirPath().toStdString());
 
 #ifdef _WIN32
-    // On Windows, updates are applied by the helper script after the app exits.
-    std::filesystem::path staging_path = app_dir / "update_staging";
-    if (std::filesystem::exists(staging_path)) {
-        try {
-            std::filesystem::remove_all(staging_path);
-        } catch (...) {
+    std::filesystem::path update_result_path = app_dir / "update_result.txt";
+    if (std::filesystem::exists(update_result_path)) {
+        std::ifstream result_file(update_result_path);
+        std::string line;
+        std::string status, backup_dir, detail;
+        while (std::getline(result_file, line)) {
+            const auto eq = line.find('=');
+            if (eq == std::string::npos)
+                continue;
+            const std::string key = line.substr(0, eq);
+            const std::string value = line.substr(eq + 1);
+            if (key == "STATUS")
+                status = value;
+            else if (key == "BACKUP_DIR")
+                backup_dir = value;
+            else if (key == "DETAIL")
+                detail = value;
+        }
+        result_file.close();
+        std::filesystem::remove(update_result_path);
+
+        if (status == "SUCCESS") {
+            QMessageBox::information(
+                nullptr, QObject::tr("Update Applied"),
+                QObject::tr("Citron Neo has been updated successfully!\n\n"
+                            "Your previous version was backed up to:\n%1")
+                    .arg(QString::fromStdString(backup_dir)));
+        } else if (!status.empty()) {
+            QMessageBox::warning(
+                nullptr, QObject::tr("Update Failed"),
+                QObject::tr("The update could not be applied and was rolled back.\n\n%1\n\n"
+                            "Your previous version is unchanged. A backup is also available at:\n%2")
+                    .arg(QString::fromStdString(detail))
+                    .arg(QString::fromStdString(backup_dir)));
         }
     }
 #else
@@ -7227,10 +7545,7 @@ bool GMainWindow::NextendoByamlRequired(u64 title_id) const {
 }
 
 bool GMainWindow::NextendoByamlDownloadEnabled() const {
-    // Disabled for now: the server-side BCAT data itself is wrong (confirmed on both citron
-    // and Ryujinx), so downloading just replaces one incorrect copy with another. Re-enable
-    // once that's fixed upstream.
-    return false;
+    return true;
 }
 
 bool GMainWindow::NextendoByamlInstalled(u64 title_id) const {
@@ -7266,26 +7581,85 @@ void GMainWindow::NextendoByamlMarkSkipped(u64 title_id) const {
 }
 
 namespace {
-std::filesystem::path NextendoByamlLastModifiedPath(const std::string& title_id_hex) {
+std::filesystem::path NextendoByamlHashPath(const std::string& title_id_hex) {
     return Common::FS::GetCitronPath(Common::FS::CitronPath::NANDDir) /
-           fmt::format("system/save/bcat/{}/.nextendo_last_modified", title_id_hex);
+           fmt::format("system/save/bcat/{}/.nextendo_bcat_hash", title_id_hex);
 }
 
-std::string NextendoByamlReadLastModified(const std::string& title_id_hex) {
-    std::ifstream file{NextendoByamlLastModifiedPath(title_id_hex)};
+std::string NextendoByamlReadHash(const std::string& title_id_hex) {
+    std::ifstream file{NextendoByamlHashPath(title_id_hex)};
     std::string value;
     std::getline(file, value);
     return value;
 }
 
-void NextendoByamlWriteLastModified(const std::string& title_id_hex, const std::string& value) {
+void NextendoByamlWriteHash(const std::string& title_id_hex, const std::string& value) {
     if (value.empty()) {
         return;
     }
-    std::ofstream file{NextendoByamlLastModifiedPath(title_id_hex)};
+    std::ofstream file{NextendoByamlHashPath(title_id_hex)};
     if (file) {
         file << value;
     }
+}
+
+// ExtractZipToDirectory doesn't reject ".." entries; pre-scan since one zip source is
+// matched by a version-tagged filename rather than a fixed, previously-verified name.
+#ifdef CITRON_ENABLE_LIBARCHIVE
+bool ZipContainsPathTraversal(const std::filesystem::path& zip_path) {
+    struct archive* a = archive_read_new();
+    if (!a) {
+        return true;
+    }
+    archive_read_support_format_zip(a);
+    archive_read_support_filter_all(a);
+
+    if (archive_read_open_filename(a, zip_path.string().c_str(), 10240) != ARCHIVE_OK) {
+        archive_read_free(a);
+        return true;
+    }
+
+    bool unsafe = false;
+    struct archive_entry* entry;
+    while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
+        const std::filesystem::path entry_path{archive_entry_pathname(entry)};
+        if (entry_path.is_absolute()) {
+            unsafe = true;
+            break;
+        }
+        for (const auto& component : entry_path) {
+            if (component == "..") {
+                unsafe = true;
+                break;
+            }
+        }
+        if (unsafe) {
+            break;
+        }
+    }
+    archive_read_free(a);
+    return unsafe;
+}
+#else
+bool ZipContainsPathTraversal(const std::filesystem::path&) {
+    return false;
+}
+#endif
+
+// Different mod release zips nest "atmosphere/" at different depths (some at the archive
+// root, some under an extra version-tagged folder), so search for it instead of assuming.
+std::filesystem::path FindAtmosphereDir(const std::filesystem::path& root) {
+    if (root.filename() == "atmosphere") {
+        return root;
+    }
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
+        !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_directory() && it->path().filename() == "atmosphere") {
+            return it->path();
+        }
+    }
+    return {};
 }
 } // namespace
 
@@ -7295,15 +7669,25 @@ bool GMainWindow::NextendoByamlDownload(u64 title_id) {
         return false;
     }
     const auto title_id_hex = fmt::format("{:016X}", title_id);
-    const auto stored_last_modified = NextendoByamlReadLastModified(title_id_hex);
-    auto check = WebService::NextendoApi::DownloadBcatSeedIfNewer(title_id_hex,
-                                                                   stored_last_modified);
-    if (check.not_modified) {
-        // Already have the current rotation schedule; nothing to redo.
-        return NextendoByamlInstalled(title_id);
-    }
-    if (check.zip_bytes.empty()) {
+
+    // Only this title ID's server-side BCAT content is kept current; fetch it for all variants.
+    constexpr u64 kCanonicalByamlTitleId = 0x0100f8f0000a2000ULL;
+    const auto fetch_title_id_hex = fmt::format("{:016X}", kCanonicalByamlTitleId);
+
+    // Always fetch the full seed and compare its hash locally, rather than trusting the
+    // server's Last-Modified/304 response as the sole freshness signal — that path could get
+    // stuck serving a stale rotation schedule if the server's conditional-GET handling doesn't
+    // track content changes precisely. Ryujinx-Nextendo hits the same server and takes the same
+    // always-fetch-and-hash approach for exactly this reason.
+    const auto zip_bytes = WebService::NextendoApi::DownloadBcatSeed(fetch_title_id_hex);
+    if (zip_bytes.empty()) {
         return false;
+    }
+
+    const auto server_hash = WebService::NextendoApi::HashBcatSeedHex(zip_bytes);
+    if (server_hash == NextendoByamlReadHash(title_id_hex) && NextendoByamlInstalled(title_id)) {
+        // Already have the current rotation schedule; nothing to redo.
+        return true;
     }
 
     const auto tmp_path = Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir) /
@@ -7313,8 +7697,8 @@ bool GMainWindow::NextendoByamlDownload(u64 title_id) {
         if (!out) {
             return false;
         }
-        out.write(reinterpret_cast<const char*>(check.zip_bytes.data()),
-                  static_cast<std::streamsize>(check.zip_bytes.size()));
+        out.write(reinterpret_cast<const char*>(zip_bytes.data()),
+                  static_cast<std::streamsize>(zip_bytes.size()));
     }
 
     const auto dest_path =
@@ -7328,7 +7712,7 @@ bool GMainWindow::NextendoByamlDownload(u64 title_id) {
     const bool ok = ExtractZipToDirectory(tmp_path, dest_path);
     std::filesystem::remove(tmp_path);
     if (ok) {
-        NextendoByamlWriteLastModified(title_id_hex, check.last_modified);
+        NextendoByamlWriteHash(title_id_hex, server_hash);
     }
     return ok;
 #else
@@ -7363,6 +7747,354 @@ void GMainWindow::RunNextendoByamlDownloadWithProgress(u64 title_id) {
 void GMainWindow::NextendoByamlDownloadFromMenu(u64 title_id) {
 #ifdef ENABLE_WEB_SERVICE
     RunNextendoByamlDownloadWithProgress(title_id);
+#endif
+}
+
+GMainWindow::SsbuModInstallOutcome GMainWindow::InstallSsbuSkylineModsBlocking(u64 program_id) {
+    SsbuModInstallOutcome outcome{};
+#ifdef ENABLE_WEB_SERVICE
+    const auto sdmc_root = Common::FS::GetCitronPath(Common::FS::CitronPath::SDMCDir);
+    const auto title_dir =
+        sdmc_root / "atmosphere" / "contents" / fmt::format("{:016X}", program_id);
+    const auto skyline_dir = title_dir / "romfs" / "skyline";
+    const auto plugins_dir = skyline_dir / "plugins";
+
+    std::error_code ec;
+    if (std::filesystem::exists(skyline_dir, ec) &&
+        !std::filesystem::is_empty(skyline_dir, ec)) {
+        const auto backup_path = skyline_dir.parent_path() /
+                                 fmt::format("skyline.backup_{}",
+                                             static_cast<s64>(std::time(nullptr)));
+        std::filesystem::rename(skyline_dir, backup_path, ec);
+        if (ec) {
+            ec.clear();
+            std::filesystem::copy(skyline_dir, backup_path,
+                                  std::filesystem::copy_options::recursive, ec);
+            if (!ec) {
+                std::filesystem::remove_all(skyline_dir, ec);
+            }
+        }
+        if (!ec) {
+            outcome.backup_made = true;
+            outcome.backup_path = backup_path;
+        } else {
+            LOG_ERROR(Frontend,
+                      "SSBU mod install: failed to back up existing skyline folder ({}): {}",
+                      skyline_dir.string(), ec.message());
+        }
+    }
+
+    std::filesystem::create_directories(plugins_dir, ec);
+
+    const auto results = WebService::SkylineMods::FetchAllSkylineModAssets();
+    const auto cache_dir = Common::FS::GetCitronPath(Common::FS::CitronPath::CacheDir);
+
+    for (const auto& result : results) {
+        if (!result.success) {
+            outcome.failed.push_back(
+                {result.display_name, result.error, result.release_page_url});
+            continue;
+        }
+
+        // Expand-Archive determines archive type from the file extension, not content, and
+        // refuses anything not literally named ".zip" -- a generic ".tmp" here silently fails
+        // extraction even though the downloaded data is a perfectly valid zip.
+        const char* tmp_extension = result.is_zip ? ".zip" : ".tmp";
+        const auto tmp_path =
+            cache_dir / fmt::format("ssbu_mod_{}{}", result.display_name, tmp_extension);
+        {
+            std::ofstream out{tmp_path, std::ios::binary};
+            if (!out) {
+                outcome.failed.push_back({result.display_name,
+                                          "failed to write temporary download file",
+                                          result.release_page_url});
+                continue;
+            }
+            out.write(reinterpret_cast<const char*>(result.data.data()),
+                      static_cast<std::streamsize>(result.data.size()));
+        }
+
+        bool ok = false;
+        std::string fail_reason = "failed to install downloaded file";
+        if (result.is_zip) {
+            if (ZipContainsPathTraversal(tmp_path)) {
+                fail_reason = "downloaded archive contains unsafe paths, refusing to extract";
+            } else {
+                const auto scratch_dir =
+                    cache_dir / fmt::format("ssbu_mod_extract_{}", result.display_name);
+                std::error_code rm_ec;
+                std::filesystem::remove_all(scratch_dir, rm_ec);
+
+                if (!ExtractZipToDirectory(tmp_path, scratch_dir)) {
+                    fail_reason = "failed to extract archive";
+                } else {
+                    const auto atmosphere_dir = FindAtmosphereDir(scratch_dir);
+                    if (atmosphere_dir.empty()) {
+                        fail_reason = "no atmosphere/ folder found in archive";
+                    } else {
+                        std::error_code copy_ec;
+                        std::filesystem::copy(atmosphere_dir, sdmc_root / "atmosphere",
+                                              std::filesystem::copy_options::recursive |
+                                                  std::filesystem::copy_options::overwrite_existing,
+                                              copy_ec);
+                        ok = !copy_ec;
+                        if (!ok) {
+                            fail_reason = "failed to merge archive into SD card: " + copy_ec.message();
+                        }
+                    }
+                }
+                std::filesystem::remove_all(scratch_dir, rm_ec);
+            }
+        } else {
+            std::error_code copy_ec;
+            std::filesystem::copy_file(tmp_path, plugins_dir / result.filename,
+                                       std::filesystem::copy_options::overwrite_existing,
+                                       copy_ec);
+            ok = !copy_ec;
+            if (!ok) {
+                fail_reason = "failed to copy file: " + copy_ec.message();
+            }
+        }
+        std::filesystem::remove(tmp_path);
+
+        if (ok) {
+            outcome.installed.push_back(result.display_name);
+        } else {
+            LOG_ERROR(Frontend, "SSBU mod install: {} failed: {}", result.display_name,
+                      fail_reason);
+            outcome.failed.push_back(
+                {result.display_name, fail_reason, result.release_page_url});
+        }
+    }
+#else
+    (void)program_id;
+#endif
+    return outcome;
+}
+
+void GMainWindow::RunSsbuSkylineModsInstallWithProgress(u64 program_id) {
+#ifdef ENABLE_WEB_SERVICE
+    QProgressDialog progress(tr("Installing Skyline mods for Super Smash Bros. Ultimate..."),
+                             QString{}, 0, 0, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setCancelButton(nullptr);
+    progress.show();
+
+    auto future = QtConcurrent::run(
+        [this, program_id] { return InstallSsbuSkylineModsBlocking(program_id); });
+    while (!future.isFinished()) {
+        QCoreApplication::processEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    progress.close();
+
+    const auto outcome = future.result();
+    QString summary = tr("%1/%2 mods installed.")
+                          .arg(outcome.installed.size())
+                          .arg(outcome.installed.size() + outcome.failed.size())
+                          .toHtmlEscaped();
+    if (!outcome.failed.empty()) {
+        summary += tr("<br><br>Failed:");
+        for (const auto& failure : outcome.failed) {
+            const QString name = QString::fromStdString(failure.display_name).toHtmlEscaped();
+            const QString reason = QString::fromStdString(failure.reason).toHtmlEscaped();
+            const QString name_html =
+                failure.release_page_url.empty()
+                    ? name
+                    : QStringLiteral("<a href=\"%1\">%2</a>")
+                          .arg(QString::fromStdString(failure.release_page_url), name);
+            summary += QStringLiteral("<br>• %1: %2").arg(name_html, reason);
+        }
+    }
+    if (outcome.backup_made) {
+        summary += tr("<br><br>Your previous skyline folder was backed up to:<br>%1")
+                      .arg(QString::fromStdString(outcome.backup_path.string()).toHtmlEscaped());
+    }
+
+    QMessageBox msg_box(outcome.failed.empty() ? QMessageBox::Information : QMessageBox::Warning,
+                       tr("Skyline Mods"), summary, QMessageBox::Ok, this);
+    if (auto* label = msg_box.findChild<QLabel*>(QStringLiteral("qt_msgbox_label"))) {
+        label->setOpenExternalLinks(true);
+    }
+    msg_box.exec();
+#else
+    (void)program_id;
+#endif
+}
+
+void GMainWindow::InstallSsbuSkylineMods(u64 program_id) {
+#ifdef ENABLE_WEB_SERVICE
+    if (!WebService::SkylineMods::IsSsbuTitleId(program_id)) {
+        return;
+    }
+    if (!question(this, tr("Install Skyline Mods"),
+                 tr("This will download the latest Skyline mod plugins for Super Smash Bros. "
+                    "Ultimate Online Deluxe and replace the contents of this game's "
+                    "romfs/skyline folder on the SD card.\n\n"
+                    "Any existing skyline folder will be backed up (renamed with a timestamp) "
+                    "before anything is replaced.\n\n"
+                    "Continue?"),
+                 QMessageBox::Yes | QMessageBox::No, QMessageBox::No)) {
+        return;
+    }
+    RunSsbuSkylineModsInstallWithProgress(program_id);
+#else
+    (void)program_id;
+#endif
+}
+
+GMainWindow::Mk8dCountryFlagOutcome GMainWindow::InstallMk8dCountryFlagBlocking(
+    u64 program_id, std::string country_code) {
+    Mk8dCountryFlagOutcome outcome{};
+#ifdef ENABLE_WEB_SERVICE
+    {
+        const FileSys::PatchManager pm(program_id, system->GetFileSystemController(),
+                                       system->GetContentProvider());
+        const auto metadata = pm.GetControlMetadata();
+        if (metadata.first != nullptr) {
+            outcome.detected_version = metadata.first->GetVersionString();
+        }
+    }
+
+    const auto fetch = WebService::Mk8dCountryFlags::FetchCountryFlagPatch(country_code);
+    outcome.release_page_url = fetch.release_page_url;
+    if (!fetch.success) {
+        outcome.error = fetch.error;
+        return outcome;
+    }
+
+    const auto sdmc_root = Common::FS::GetCitronPath(Common::FS::CitronPath::SDMCDir);
+    const auto exefs_dir = sdmc_root / "atmosphere" / "contents" /
+                           fmt::format("{:016X}", program_id) / "exefs";
+    std::error_code ec;
+    std::filesystem::create_directories(exefs_dir, ec);
+    if (ec) {
+        outcome.error = "failed to create exefs mod folder: " + ec.message();
+        return outcome;
+    }
+
+    const auto ips_path =
+        exefs_dir / (std::string{WebService::Mk8dCountryFlags::MK8D_BUILD_ID} + ".ips");
+    std::ofstream out{ips_path, std::ios::binary};
+    if (!out) {
+        outcome.error = "failed to write patch file to SD card";
+        return outcome;
+    }
+    out.write(reinterpret_cast<const char*>(fetch.data.data()),
+             static_cast<std::streamsize>(fetch.data.size()));
+    outcome.success = true;
+#else
+    (void)program_id;
+    (void)country_code;
+#endif
+    return outcome;
+}
+
+void GMainWindow::RunMk8dCountryFlagInstallWithProgress(u64 program_id,
+                                                        const std::string& country_code) {
+#ifdef ENABLE_WEB_SERVICE
+    QProgressDialog progress(tr("Installing country flag patch..."), QString{}, 0, 0, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setCancelButton(nullptr);
+    progress.show();
+
+    auto future = QtConcurrent::run(
+        [this, program_id, country_code] {
+            return InstallMk8dCountryFlagBlocking(program_id, country_code);
+        });
+    while (!future.isFinished()) {
+        QCoreApplication::processEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    progress.close();
+
+    const auto outcome = future.result();
+    QString summary;
+    if (outcome.success) {
+        summary = tr("Country flag installed. This takes effect the next time you launch "
+                     "Mario Kart 8 Deluxe.");
+        if (!outcome.detected_version.empty() &&
+            outcome.detected_version != WebService::Mk8dCountryFlags::MK8D_REQUIRED_VERSION) {
+            summary += tr("<br><br>Warning: your installed version is %1, but this patch "
+                          "requires version %2. It will not take effect until the game is "
+                          "updated to that version.")
+                          .arg(QString::fromStdString(outcome.detected_version).toHtmlEscaped(),
+                               QString::fromLatin1(
+                                   WebService::Mk8dCountryFlags::MK8D_REQUIRED_VERSION));
+        }
+    } else {
+        summary = tr("Failed to install: %1")
+                     .arg(QString::fromStdString(outcome.error).toHtmlEscaped());
+        if (!outcome.release_page_url.empty()) {
+            summary += tr("<br><br>You can download and install it manually from "
+                          "<a href=\"%1\">%1</a>.")
+                          .arg(QString::fromStdString(outcome.release_page_url));
+        }
+    }
+
+    QMessageBox msg_box(outcome.success ? QMessageBox::Information : QMessageBox::Warning,
+                       tr("MK8D Country Flag"), summary, QMessageBox::Ok, this);
+    if (auto* label = msg_box.findChild<QLabel*>(QStringLiteral("qt_msgbox_label"))) {
+        label->setOpenExternalLinks(true);
+    }
+    msg_box.exec();
+#else
+    (void)program_id;
+    (void)country_code;
+#endif
+}
+
+void GMainWindow::InstallMk8dCountryFlag(u64 program_id) {
+#ifdef ENABLE_WEB_SERVICE
+    if (!WebService::Mk8dCountryFlags::IsMk8dTitleId(program_id)) {
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Set MK8D Country Flag"));
+
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* info_label = new QLabel(
+        tr("Pick the country you want to appear as online. This writes an exefs patch to "
+           "your SD card and requires Mario Kart 8 Deluxe version %1.")
+            .arg(QString::fromLatin1(WebService::Mk8dCountryFlags::MK8D_REQUIRED_VERSION)));
+    info_label->setWordWrap(true);
+    layout->addWidget(info_label);
+
+    auto* combo = new QComboBox(&dialog);
+    std::vector<WebService::Mk8dCountryFlags::CountryInfo> sorted_countries(
+        WebService::Mk8dCountryFlags::kSupportedCountries.begin(),
+        WebService::Mk8dCountryFlags::kSupportedCountries.end());
+    std::sort(sorted_countries.begin(), sorted_countries.end(),
+             [](const auto& l, const auto& r) { return std::string_view{l.name} <
+                                                       std::string_view{r.name}; });
+    for (const auto& country : sorted_countries) {
+        combo->addItem(QStringLiteral("%1 (%2)")
+                          .arg(QString::fromUtf8(country.name), QString::fromLatin1(country.code)),
+                       QString::fromLatin1(country.code));
+    }
+    layout->addWidget(combo);
+
+    auto* button_box =
+        new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    auto* manual_button =
+        button_box->addButton(tr("Open Download Page"), QDialogButtonBox::ActionRole);
+    connect(manual_button, &QPushButton::clicked, &dialog, [] {
+        QDesktopServices::openUrl(
+            QUrl(QString::fromLatin1(WebService::Mk8dCountryFlags::MK8D_REPO_URL)));
+    });
+    connect(button_box, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(button_box, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(button_box);
+
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const std::string country_code = combo->currentData().toString().toStdString();
+    RunMk8dCountryFlagInstallWithProgress(program_id, country_code);
+#else
+    (void)program_id;
 #endif
 }
 

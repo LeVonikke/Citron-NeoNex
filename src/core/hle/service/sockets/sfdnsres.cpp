@@ -2,8 +2,13 @@
 // SPDX-FileCopyrightText: Copyright 2025 citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <charconv>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -12,6 +17,7 @@
 #include "common/string_util.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/hle/kernel/svc/nextendo_deadline_watch.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/sockets/sfdnsres.h"
 #include "core/hle/service/sockets/sockets.h"
@@ -38,6 +44,35 @@ std::string GetLastHostForIp(const std::string& ip) {
     return "";
 }
 
+// [Nextendo] See sfdnsres.h's declaration comment. Real bug this exists for (Splatoon 3,
+// confirmed via Ryujinx-Nextendo hitting the identical failure on the same guest binary):
+// its gRPC channel resolves a redirected Nextendo hostname correctly here, then later loses
+// that address in its own connection-establishment plumbing and calls connect() with a
+// zeroed IP -- but the SAME port it originally resolved for. Recording "port -> resolved IP"
+// at resolution time lets BSD::ConnectImpl recover the real address for that exact port.
+static std::mutex g_last_ip_for_port_mutex;
+static std::unordered_map<u16, Network::IPv4Address> g_last_ip_for_port;
+
+void SetLastIpForPort(u16 port, Network::IPv4Address ip) {
+    if (port == 0) {
+        return;
+    }
+    std::lock_guard lock(g_last_ip_for_port_mutex);
+    g_last_ip_for_port[port] = ip;
+}
+
+std::optional<Network::IPv4Address> GetLastIpForPort(u16 port) {
+    if (port == 0) {
+        return std::nullopt;
+    }
+    std::lock_guard lock(g_last_ip_for_port_mutex);
+    auto it = g_last_ip_for_port.find(port);
+    if (it != g_last_ip_for_port.end()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
 // No server address is baked in: unconfigured builds fall back to loopback and redirect nowhere.
 static std::string GetConfiguredIp(const std::string& setting, const char* env_var) {
     if (!setting.empty()) {
@@ -49,8 +84,30 @@ static std::string GetConfiguredIp(const std::string& setting, const char* env_v
     return "127.0.0.1";
 }
 
+// [Nextendo] La redirection est-elle active ?
+//
+// Le reglage « enable_nextendo » n'existe QUE dans la facade Qt (src/citron/main.cpp) : la facade
+// SDL (citron_cmd) ne le cable nulle part et le reecrit a sa valeur par defaut, false, au
+// demarrage. Mesure du 2026-08-25 : lance par citron-cmd, Splatoon 3 a resolu
+// « t-dce9377b-lp1.lp1.t.npln.srv.nintendo.net » vers 34.49.112.177 — le VRAI serveur de Nintendo —
+// alors que le fichier de configuration portait bien enable_nextendo=true.
+//
+// On accepte donc aussi une activation par l'environnement, exactement comme GetConfiguredIp le
+// fait deja pour les deux adresses. Une valeur vide, « 0 », « false » ou « no » ne l'active pas.
+static bool RedirectionNextendoActive() {
+    if (Settings::values.enable_nextendo.GetValue()) {
+        return true;
+    }
+    const char* env = std::getenv("NEXTENDO_ENABLE");
+    if (env == nullptr || *env == '\0') {
+        return false;
+    }
+    const std::string v = Common::ToLower(env);
+    return v != "0" && v != "false" && v != "no" && v != "off";
+}
+
 static std::optional<std::string> GetNextendoRedirectIp(const std::string& host) {
-    if (!Settings::values.enable_nextendo.GetValue()) {
+    if (!RedirectionNextendoActive()) {
         return std::nullopt;
     }
 
@@ -72,7 +129,76 @@ static std::optional<std::string> GetNextendoRedirectIp(const std::string& host)
         return server_ip;
     }
 
+    // Titles published by Activision/Blizzard reach Demonware rather than Nintendo's own
+    // services: auth over TLS, the lobby and NAT discovery on 3074, and the shared
+    // stun.<region>.demonware.net responders.
+    if (host == "demonware.net" || host.ends_with(".demonware.net")) {
+        LOG_INFO(Service, "[Nextendo] Redirecting Demonware host '{}' -> '{}'", host, server_ip);
+        return server_ip;
+    }
+
     return std::nullopt;
+}
+
+// [Nextendo] Debug-only tap: redirects an "npln" host straight to a local TLS-terminating
+// proxy instead of production, for protocol inspection. Independent of enable_nextendo (this
+// isn't a Nextendo-server redirect, just a temporary debugging aid) -- unset by default, so it
+// never affects a normal run. NEXTENDO_S3_DEBUG_PROXY_IP=<ip> to enable.
+static std::optional<std::string> GetNplnDebugProxyIp(const std::string& host) {
+    if (Common::ToLower(host).find("npln") == std::string::npos) {
+        return std::nullopt;
+    }
+    const char* env = std::getenv("NEXTENDO_S3_DEBUG_PROXY_IP");
+    if (!env || !*env) {
+        return std::nullopt;
+    }
+    LOG_INFO(Service, "[Nextendo] Redirecting npln host '{}' -> debug proxy '{}'", host, env);
+    return std::string(env);
+}
+
+// [Nextendo] Optional delay before the first "npln" host resolution, against a hypothesized
+// startup deadlock. Disabled by default (max_wait_ms=0) -- unconfirmed benefit, and a nonzero
+// delay now blocks every other socket IPC call too (bsdsocket is single-threaded).
+// NEXTENDO_NPLN_DELAY_MS opts back into a fixed wait if ever needed.
+static std::once_flag g_npln_delay_once;
+
+static void MaybeDelayNplnInit(const std::string& host) {
+    if (Common::ToLower(host).find("npln") == std::string::npos) {
+        return;
+    }
+    std::call_once(g_npln_delay_once, [] {
+        int max_wait_ms = 0;
+        if (const char* env = std::getenv("NEXTENDO_NPLN_DELAY_MS"); env && *env) {
+            try {
+                const int parsed = std::stoi(env);
+                if (parsed >= 0) {
+                    max_wait_ms = parsed;
+                }
+            } catch (const std::exception&) {
+                // Malformed override -- keep the default rather than fail resolution over it.
+            }
+        }
+        if (max_wait_ms <= 0) {
+            return;
+        }
+
+        LOG_INFO(Service,
+                 "[Nextendo] Holding the first npln host resolution until the JIT/shader-compile "
+                 "burst settles before gRPC's connection setup starts ({} ms) (see "
+                 "MaybeDelayNplnInit)",
+                 max_wait_ms);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(max_wait_ms));
+
+        LOG_INFO(Service, "[Nextendo] npln hold finished after {} ms", max_wait_ms);
+
+        // [Nextendo][DIAG] Arm a short window during which any finite, non-trivial
+        // WaitSynchronization timeout gets logged -- see nextendo_deadline_watch.h. This is
+        // trying to directly OBSERVE the game's gRPC call deadline (if it's implemented as a
+        // timed kernel wait) rather than continuing to guess at it via static binary analysis.
+        Kernel::Svc::ArmNextendoDeadlineWatch(90000);
+        LOG_INFO(Service, "[Nextendo][DIAG] Deadline watch armed for 90000 ms");
+    });
 }
 
 enum class NetDbError : s32 {
@@ -217,6 +343,11 @@ static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestConte
     const auto host_buffer = ctx.ReadBuffer(0);
     std::string host = Common::StringFromBuffer(host_buffer);
 
+    LOG_INFO(Service, "[Nextendo] DNS resolve (GetHostByName) requested: host={}", host);
+
+    // [Nextendo] See MaybeDelayNplnInit's declaration comment.
+    MaybeDelayNplnInit(host);
+
     if (parameters.use_nsd_resolve || host.find('%') != std::string::npos) {
         auto pos = host.find('%');
         if (pos != std::string::npos) {
@@ -309,8 +440,18 @@ static std::vector<u8> SerializeAddrInfo(const std::vector<Network::AddrInfo>& v
         Append<u32_be>(data, sizeof(SockAddrIn));                                // ai_addrlen
         // ^ *not* sizeof(SerializedSockAddrIn), not that it matters since they're the same size
 
-        // ai_addr:
-        Append<u16_be>(data, static_cast<u16>(Translate(addrinfo.addr.family))); // sin_family
+        // ai_addr: BSD-style sockaddr_in, matching the SockAddrIn struct in sockets.h --
+        // {u8 sin_len; u8 sin_family; u16 sin_port; u8 sin_addr[4]; u8 sin_zero[8];}. This used
+        // to write sin_family as a single 2-byte big-endian value, which skips sin_len entirely
+        // (leaving it implicitly 0x00) instead of emitting it as its own leading byte. A guest
+        // resolver walker that trusts sin_len -- and gRPC-based titles (Splatoon 3) that build
+        // their own connect() sockaddr straight out of this buffer -- reads a zero-length
+        // address off a sin_len of 0 and falls back to connecting to 0.0.0.0. Exactly matches
+        // Ryujinx-Nextendo's AddrInfo4.Length fix (was sizeof(Array4<byte>)=4, needed to be
+        // sizeof(AddrInfo4)=16): sin_len must be the full sockaddr size, not folded away.
+        // [Nextendo]
+        Append<u8>(data, static_cast<u8>(sizeof(SockAddrIn)));              // sin_len
+        Append<u8>(data, static_cast<u8>(Translate(addrinfo.addr.family))); // sin_family
         // On the Switch, the following fields are passed through htonl despite
         // already being big-endian, so they end up as little-endian.
         Append<u16_le>(data, addrinfo.addr.portno);                            // sin_port
@@ -351,6 +492,75 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
     const auto host_buffer = ctx.ReadBuffer(0);
     std::string host = Common::StringFromBuffer(host_buffer);
 
+    LOG_INFO(Service, "[Nextendo] DNS resolve (GetAddrInfo) requested: host={}", host);
+
+    // [Nextendo] See MaybeDelayNplnInit's declaration comment.
+    MaybeDelayNplnInit(host);
+
+    // [Nextendo] A literal IP has nothing to resolve -- return it as-is, before any of the
+    // redirect/blocklist/NSD-rewrite logic below, all of which exist to turn a HOSTNAME into
+    // the right address and have no business touching an address that's already one. See
+    // TryParseIPv4Literal's declaration comment in internal_network/network.h for why falling
+    // through to a real resolution here (which is what happened before this check existed) was
+    // the actual root cause of Splatoon 3's NPLN connections completing TCP+TLS+HTTP/2 and then
+    // silently closing without ever sending a HEADERS frame -- confirmed live: citron's own
+    // connect cycles for this exact hostname resolved and connected correctly, but every one
+    // still sent only a single small request and closed within ~1s of the server's reply, on
+    // every cycle regardless of timing -- consistent with the game building an HTTP/2
+    // :authority header from a corrupted canonical name, not any citron-side socket/scheduling
+    // issue (both were separately investigated at length and ruled out).
+    std::optional<std::string> service = std::nullopt;
+    if (ctx.CanReadBuffer(1)) {
+        const std::span<const u8> service_buffer = ctx.ReadBuffer(1);
+        service = Common::StringFromBuffer(service_buffer);
+    }
+
+    if (Network::IPv4Address literal_ip; Network::TryParseIPv4Literal(host, literal_ip)) {
+        u32 requested_type = 0;
+        u32 requested_protocol = 0;
+        if (ctx.CanReadBuffer(2)) {
+            const auto hints = ctx.ReadBuffer(2);
+            if (hints.size() >= 24) {
+                std::array<u32_be, 6> header{};
+                std::memcpy(header.data(), hints.data(), sizeof(header));
+                if (header[0] == 0xBEEFCAFE) {
+                    requested_type = header[3];
+                    requested_protocol = header[4];
+                }
+            }
+        }
+        const bool udp = requested_type == static_cast<u32>(Type::DGRAM) ||
+                         requested_protocol == static_cast<u32>(Protocol::UDP);
+        u16 literal_port = 0;
+        if (service.has_value() && !service->empty()) {
+            const char* const first = service->data();
+            const char* const last = first + service->size();
+            const auto [end, ec] = std::from_chars(first, last, literal_port);
+            if (ec != std::errc{} || end != last) {
+                return {0, GetAddrInfoError::SERVICE};
+            }
+        }
+        LOG_DEBUG(Service, "[Nextendo] Host '{}' is already a literal address: returned as-is",
+                  host);
+        Network::AddrInfo entry{};
+        entry.family = Network::Domain::INET;
+        entry.socket_type = udp ? Network::Type::DGRAM : Network::Type::STREAM;
+        entry.protocol = udp ? Network::Protocol::UDP : Network::Protocol::TCP;
+        entry.addr.family = Network::Domain::INET;
+        entry.addr.ip = literal_ip;
+        entry.addr.portno = literal_port;
+        entry.canon_name = host;
+
+        // Deliberately no SetLastHostForIp here, matching Ryujinx-Nextendo's own fix -- a
+        // literal IP carries no hostname to record, and recording one would corrupt the
+        // reverse lookup table used elsewhere for this exact purpose (see
+        // GetLastHostForIp's declaration comment).
+        const std::vector<u8> data = SerializeAddrInfo({entry}, host);
+        const u32 data_size = static_cast<u32>(data.size());
+        ctx.WriteBuffer(data, 0);
+        return {data_size, GetAddrInfoError::SUCCESS};
+    }
+
     if (parameters.use_nsd_resolve || host.find('%') != std::string::npos) {
         auto pos = host.find('%');
         if (pos != std::string::npos) {
@@ -363,18 +573,15 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
     }
 
     std::string query_host = host;
-    auto redirect = GetNextendoRedirectIp(host);
+    auto redirect = GetNplnDebugProxyIp(host);
+    if (!redirect.has_value()) {
+        redirect = GetNextendoRedirectIp(host);
+    }
     if (redirect.has_value()) {
         query_host = *redirect;
     } else if (blocked_domains.find(host) != blocked_domains.end()) {
         LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
         return {0, GetAddrInfoError::AGAIN};
-    }
-
-    std::optional<std::string> service = std::nullopt;
-    if (ctx.CanReadBuffer(1)) {
-        const std::span<const u8> service_buffer = ctx.ReadBuffer(1);
-        service = Common::StringFromBuffer(service_buffer);
     }
 
     auto res = Network::GetAddressInfo(query_host, service);
@@ -383,8 +590,40 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
     }
 
     if (redirect.has_value()) {
+        // [Nextendo] GetAddressInfo never requests AI_CANONNAME, so canon_name comes back
+        // unset for a normal resolution -- SerializeAddrInfo then writes an empty canonical
+        // name. That's harmless for titles that never look at it, but this query just resolved
+        // a REDIRECT TARGET (a literal IP string), not the real host, so even if canon_name
+        // were populated by the OS resolver it would be the numeric IP, never the actual
+        // hostname. A gRPC-based title (Splatoon 3) builds its HTTP/2 :authority header from
+        // this canonical name -- sending it empty (or the wrong literal IP) instead of the real
+        // npln hostname is exactly the shape of bug already fixed above for an already-literal
+        // host (see that comment): TCP+TLS+HTTP/2 complete fine, then the connection is torn
+        // down before a real HEADERS frame ever goes out. Force it back to the real host here,
+        // matching that same fix.
+        for (auto& addrinfo : res.value()) {
+            addrinfo.canon_name = host;
+        }
+
+        // [Nextendo] Port-keyed recovery for gRPC-based titles (Splatoon 3) that lose this
+        // resolved address later. See SetLastIpForPort's declaration comment in sfdnsres.h.
+        std::optional<u16> service_port;
+        if (service.has_value()) {
+            try {
+                const int parsed = std::stoi(*service);
+                if (parsed > 0 && parsed <= 0xFFFF) {
+                    service_port = static_cast<u16>(parsed);
+                }
+            } catch (const std::exception&) {
+                // service wasn't a plain port number (a named service like "http") -- nothing
+                // to key the fallback on, and that's fine, most titles never need it anyway.
+            }
+        }
         for (const auto& addrinfo : res.value()) {
             SetLastHostForIp(Network::IPv4AddressToString(addrinfo.addr.ip), host);
+            if (service_port.has_value()) {
+                SetLastIpForPort(*service_port, addrinfo.addr.ip);
+            }
         }
     }
 

@@ -3,7 +3,14 @@
 
 #include <chrono>
 #include <mutex>
+#include <thread>
 
+#include <fmt/format.h>
+
+#include "common/fs/file.h"
+#include "common/fs/fs.h"
+#include "common/fs/path_util.h"
+#include "common/nextendo_account.h"
 #include "common/nextendo_friends.h"
 
 namespace Common::NextendoFriends {
@@ -21,14 +28,62 @@ std::chrono::steady_clock::time_point g_local_last_push{};
 constexpr auto kPresenceRefreshInterval = std::chrono::seconds{45};
 } // Anonymous namespace
 
+namespace {
+// [Nextendo] Mirror the friend list onto the guest's SD card, the same way
+// NextendoAccount::WriteGuestBridge exposes the signed-in account. Homebrew has no route to
+// the friend service's IPC, so a plain file is the only way a title like Golden Balloon can
+// know who your friends are -- which is what lets it offer "race this friend's ghost"
+// instead of only a global leaderboard.
+//
+// Written on every refresh rather than once at boot, so a friend coming online is reflected
+// without restarting the game. Name goes last on each line because it is the only field that
+// could contain a comma.
+void WriteFriendBridgeLocked(const std::vector<Entry>& entries) {
+    const auto path = FS::GetCitronPath(FS::CitronPath::SDMCDir) / "config" / "nextendo" /
+                      "friends.txt";
+    if (!NextendoAccount::IsLinked()) {
+        void(FS::RemoveFile(path)); // signed out -- do not leave a stale list behind
+        return;
+    }
+    void(FS::CreateParentDirs(path));
+
+    std::string contents;
+    for (const auto& entry : entries) {
+        if (entry.pid == 0) {
+            continue;
+        }
+        contents += fmt::format("{},{},{}\n", entry.pid, entry.status, entry.name);
+    }
+    void(FS::WriteStringToFile(path, FS::FileType::TextFile, contents));
+}
+} // Anonymous namespace
+
 void Set(std::vector<Entry> entries) {
     std::lock_guard lock{g_mutex};
     g_entries = std::move(entries);
+    WriteFriendBridgeLocked(g_entries);
 }
 
 std::vector<Entry> Get() {
     std::lock_guard lock{g_mutex};
     return g_entries;
+}
+
+std::vector<Entry> GetWarm(int timeout_ms) {
+    auto entries = Get(); // Same background refresh Get() always relies on -- just wait for it.
+    if (!entries.empty() || !Common::NextendoAccount::IsLinked()) {
+        return entries;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        entries = Get();
+        if (!entries.empty()) {
+            break;
+        }
+    }
+    return entries;
 }
 
 void SetLocalPresence(s32 status, std::string app_field) {

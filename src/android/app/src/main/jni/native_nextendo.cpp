@@ -6,7 +6,7 @@
 
 #include <jni.h>
 
-#include "citron/nextendo_compatible_titles.h"
+#include "common/nextendo_compatible_titles.h"
 #include "common/android/android_common.h"
 #include "common/android/id_cache.h"
 #include "common/logging.h"
