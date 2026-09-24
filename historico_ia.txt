@@ -13,3 +13,9 @@
 - HEAD antes 81791afd1 -> depois bb1895e49. Backup local backup/pre-sync-* (container efemero; o estado antigo continua em origin/nextendo-android). nextendo-android NAO foi alterado -- a integracao vai por PR a partir de claude/practical-mendel-98ce3u.
 - NAO VERIFICADO: nao compilei (nem Android nem host). O CI Android so corre em push para nextendo-android ou workflow_dispatch, por isso o PR sozinho nao valida o build.
 - Proximo passo recomendado: 1) obter o client id emitido pela Nextendo e criar o secret NEXTENDO_CLIENT_ID + passo no build-android-release.yml que gera nextendo_secrets.h (nos dois jobs, build-apk e conn-test); 2) correr o workflow manualmente (workflow_dispatch) no ramo do PR antes de fazer merge para nextendo-android; 3) em syncs futuros seguir upstream/main, nao upstream/nextendo-android.
+
+=== 2026-09-24 (cont.) - passo do client id Nextendo adicionado ao build-android-release.yml ===
+- A pedido do utilizador, adicionado o passo "Generate Nextendo client id header" nos dois jobs (build-apk, antes do gradle; conn-test, antes do cmake configure). Gera src/web_service/nextendo_secrets.h a partir do secret NEXTENDO_CLIENT_ID, igual ao que o upstream faz em build-linux.yml/build-windows.yml.
+- Diferenca deliberada face ao upstream: se o secret faltar, da ::warning:: e continua (o upstream falha o build). Assim o fork continua a compilar ate o id existir -- mas um APK assim construido NAO consegue fazer login.
+- VERIFICADO: YAML valido e o script gera o header certo (testado localmente com um id falso, ficheiro apagado depois). NAO VERIFICADO: build real no CI.
+- Proximo passo recomendado: criar o secret NEXTENDO_CLIENT_ID em Settings -> Secrets and variables -> Actions, correr o workflow manualmente e confirmar login num dispositivo.

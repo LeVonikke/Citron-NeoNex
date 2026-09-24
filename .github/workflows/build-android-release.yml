@@ -110,6 +110,25 @@ jobs:
           echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
           echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
 
+      # Since upstream ddfd42a1c the backend rejects every /api/ call (including OAuth sign-in)
+      # that doesn't carry the issued X-Nextendo-Client-Id. Upstream fails its desktop builds
+      # without it; here it's only a warning so the fork keeps building until the secret is set.
+      - name: Generate Nextendo client id header
+        env:
+          NEXTENDO_CLIENT_ID: ${{ secrets.NEXTENDO_CLIENT_ID }}
+        run: |
+          if [ -z "$NEXTENDO_CLIENT_ID" ]; then
+            echo "::warning::NEXTENDO_CLIENT_ID secret is not set; Nextendo sign-in/API calls will be rejected by the server"
+            exit 0
+          fi
+          cat > src/web_service/nextendo_secrets.h <<EOF
+          #pragma once
+
+          namespace WebService::NextendoApi {
+          constexpr const char* AppClientId = "$NEXTENDO_CLIENT_ID";
+          }
+          EOF
+
       - name: Build debug + release APKs
         working-directory: src/android
         env:
@@ -172,6 +191,22 @@ jobs:
           restore-keys: |
             vcpkg-archives-host-${{ hashFiles('vcpkg.json') }}-
             vcpkg-archives-host-
+
+      - name: Generate Nextendo client id header
+        env:
+          NEXTENDO_CLIENT_ID: ${{ secrets.NEXTENDO_CLIENT_ID }}
+        run: |
+          if [ -z "$NEXTENDO_CLIENT_ID" ]; then
+            echo "::warning::NEXTENDO_CLIENT_ID secret is not set; conn-test will run without the client id header"
+            exit 0
+          fi
+          cat > src/web_service/nextendo_secrets.h <<EOF
+          #pragma once
+
+          namespace WebService::NextendoApi {
+          constexpr const char* AppClientId = "$NEXTENDO_CLIENT_ID";
+          }
+          EOF
 
       - name: Configure (common + web_service only)
         env:
