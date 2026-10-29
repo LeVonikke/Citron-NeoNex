@@ -1,0 +1,124 @@
+name: Genova · catálogo de atualizações
+'on':
+  release:
+    types:
+    - published
+  push:
+    paths:
+    - .github/workflows/genova-updates.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag da release já publicada
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: genova-updates-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  catalog:
+    if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      APP_ID: citron-neonex
+      APP_NAME: Citron NeoNex
+      APP_REPOSITORY: LeVonikke/Citron-NeoNex
+    steps:
+    - name: Inspecionar artefatos e publicar catálogo do próprio app
+      shell: bash
+      run: |
+        python3 <<'GENOVA_CATALOG'
+        """Build a catalog from already-published artifacts. Never runs downloaded installers."""
+        from __future__ import annotations
+        import hashlib,json,os,re,subprocess,tempfile,zipfile
+        from pathlib import Path
+        SAFE_NAME=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,180}')
+
+        def command(*args):
+            result=subprocess.run(args,capture_output=True,text=True,timeout=90)
+            if result.returncode:raise RuntimeError('Artifact inspection failed: '+Path(args[0]).name)
+            return result.stdout
+
+        def apk_info(path:Path,asset:dict,tools:Path)->dict:
+            badging=command(str(tools/'aapt2'),'dump','badging',str(path))
+            command(str(tools/'apksigner'),'verify',str(path))
+            package=next(line for line in badging.splitlines() if line.startswith('package:'))
+            def field(key):
+                match=re.search(r"(?:^| )"+re.escape(key)+r"='([^']*)'",package)
+                if not match:raise ValueError('Missing APK '+key)
+                return match.group(1)
+            sdk=re.search(r"^sdkVersion:'([0-9]+)'",badging,re.M)
+            native=re.search(r'^native-code:(.*)$',badging,re.M)
+            abis=re.findall(r"'([^']+)'",native.group(1)) if native else ['universal']
+            return {'packageId':field('name'),'name':os.environ['APP_NAME'],'versionCode':int(field('versionCode')),'versionName':field('versionName'),'minSdk':int(sdk.group(1)) if sdk else 1,'abis':abis,'assetName':asset['name'],'size':path.stat().st_size,'sha256':file_hash(path)}
+
+        def file_hash(path):
+            with path.open('rb') as file:return hashlib.file_digest(file,'sha256').hexdigest()
+
+        def infer_desktop(path:Path,asset:dict,tag:str)->dict|None:
+            lower=path.name.lower();kind=None;platform=None
+            for extension,p,k in [('.appimage','linux','appimage'),('.deb','linux','deb'),('.rpm','linux','rpm'),('.msi','windows','msi'),('.exe','windows','exe'),('.dmg','macos','dmg'),('.pkg','macos','pkg')]:
+                if lower.endswith(extension):platform=p;kind=k;break
+            if not kind:return None
+            if re.search(r'(arm64|aarch64)',lower):arch='arm64'
+            elif re.search(r'(amd64|x86_64|x64)',lower):arch='x86_64'
+            elif 'universal' in lower:arch='universal'
+            else:
+                info=command('file','-b',str(path)).lower()
+                if 'x86-64' in info or 'x86_64' in info:arch='x86_64'
+                elif 'aarch64' in info or 'arm64' in info:arch='arm64'
+                elif kind=='deb':
+                    cpu=command('dpkg-deb','-f',str(path),'Architecture').strip();arch={'amd64':'x86_64','arm64':'arm64','all':'universal'}.get(cpu)
+                    if not arch:return None
+                else:return None
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,100}',tag):raise ValueError('Release tag must be a version-like name without slashes')
+            return {'platform':platform,'arch':arch,'kind':kind,'version':tag,'assetName':asset['name'],'size':path.stat().st_size,'sha256':file_hash(path)}
+
+        def main():
+            repo=os.environ['GITHUB_REPOSITORY'];expected=os.environ['APP_REPOSITORY'];tag=os.environ.get('RELEASE_TAG','');app_id=os.environ['APP_ID'];name=os.environ['APP_NAME']
+            if repo!=expected:raise RuntimeError('Repository identity mismatch')
+            if not tag:
+                releases=json.loads(command('gh','release','list','--repo',repo,'--limit','30','--json','tagName,isDraft'))
+                published=[item for item in releases if not item['isDraft']]
+                if not published:
+                    print('No published releases yet; updater pipeline is configured for',repo);return
+                tag=published[0]['tagName']
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,100}',tag):raise ValueError('Invalid release tag')
+            release=json.loads(command('gh','release','view',tag,'--repo',repo,'--json','assets,isDraft'))
+            if release['isDraft']:raise RuntimeError('Publish the release before creating its update catalog')
+            catalog={'schema':1,'application':{'id':app_id,'name':name,'repository':repo},'apps':[],'desktop':[]}
+            sdk=Path(os.environ.get('ANDROID_HOME','/usr/local/lib/android/sdk'))/'build-tools'
+            tools=next((p for p in sorted(sdk.glob('*'),reverse=True) if (p/'aapt2').is_file() and (p/'apksigner').is_file()),None)
+            with tempfile.TemporaryDirectory() as temp:
+                root=Path(temp)
+                for asset in release['assets']:
+                    filename=asset['name']
+                    if not SAFE_NAME.fullmatch(filename) or not 0<asset.get('size',0)<=2*1024**3:continue
+                    if not filename.lower().endswith(('.apk','.appimage','.deb','.rpm','.msi','.exe','.dmg','.pkg')):continue
+                    command('gh','release','download',tag,'--repo',repo,'--pattern',filename,'--dir',str(root))
+                    path=root/filename
+                    if path.stat().st_size!=asset['size']:raise RuntimeError('Asset size mismatch')
+                    if filename.lower().endswith('.apk'):
+                        if not tools:raise RuntimeError('Android SDK build-tools are required for APK inspection')
+                        item=apk_info(path,asset,tools)
+                        if item['size']>536870912 or item['minSdk']<1:raise RuntimeError('APK outside supported updater limits')
+                        prior=next((x for x in catalog['apps'] if x['packageId']==item['packageId']),None)
+                        score=lambda x:(x['versionCode'],int('universal' in x['abis']),int('arm64-v8a' in x['abis']))
+                        if prior is None:catalog['apps'].append(item)
+                        elif score(item)>score(prior):catalog['apps'].remove(prior);catalog['apps'].append(item)
+                    else:
+                        item=infer_desktop(path,asset,tag)
+                        if item:catalog['desktop'].append(item)
+                if not catalog['apps'] and not catalog['desktop']:raise RuntimeError('No compatible packaged artifacts. Source archives alone are not app updates.')
+                output=root/'genova-update.json';output.write_text(json.dumps(catalog,ensure_ascii=False,indent=2)+'\n')
+                if output.stat().st_size>65536:raise RuntimeError('Catalog exceeds updater limit')
+                command('gh','release','upload',tag,'--repo',repo,str(output),'--clobber')
+                print('Update catalog published for',repo,tag)
+        if __name__=='__main__':main()
+
+        GENOVA_CATALOG
